@@ -524,6 +524,7 @@ skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负
 17. `X-Panel-Actor: robot` 不报错，`actor` 记为 `human`
 18. 未提供 `tags` 存 `","`；提供 `"  ,  ,"` 返回 422
 19. **`PATCH {"tags": null}` 与 `PATCH {"position": null}` 均返回 422 且不落库**（第 5.5 节的无例外 null 守卫，必须有回归锁）
+20. **CLI `edit` 的 PATCH 语义**：`没传的字段不被改动`（反向断言，回读数据库而不是看 stdout）、`传空串是「清空」不是「不改」`、`--status` 不存在于 parser`（状态唯一入口是 `/advance`，见第 5.1 节）。**判据必须是 `is not None` 而不是真值判断**——写成 `if v:` 会让 agent 永远清不掉描述，而退出码 0、输出「已修改：描述」全都正常，只有回读账本才抓得到
 
 目标：改后端后一条命令能确认没回归。
 
