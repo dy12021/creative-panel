@@ -513,11 +513,60 @@ def test_update_idea_non_string_text_raises_invalid(field, bad, conn):
     assert [e["kind"] for e in got["events"]] == ["created"]
 
 
-def test_position_is_not_type_checked(conn):
-    """position 是 REAL 列，不能套字符串校验——拖拽传小数必须照常工作。"""
+def test_position_requires_a_number(conn):
+    """position 是 REAL 列：非数字必须拒，不能静默存 TEXT 破坏列内排序。
+
+    SPEC 4.2 说的"只存不校验"指不校验**取值范围**，类型仍要卡。
+    """
     a = create_idea("x")
     assert update_idea(a["id"], {"position": 3.5})["position"] == 3.5
-    assert update_idea(a["id"], {"position": "7"})["position"] == 7.0
+    assert update_idea(a["id"], {"position": 7})["position"] == 7.0
+    assert create_idea("y", position=2.5)["position"] == 2.5
+    for bad in ("abc", "7", [1], True):
+        with pytest.raises(Invalid):
+            update_idea(a["id"], {"position": bad})
+        with pytest.raises(Invalid):
+            create_idea("z", position=bad)
+        with pytest.raises(Invalid):            # 每次用新卡，避免撞"已经处于此状态"
+            advance(create_idea("w")["id"], "building", position=bad)
+
+
+def test_position_none_means_auto_for_create_and_advance(conn):
+    """position=None 在建卡/推进时是"自动分配"的合法缺省，与 tags=None 同类。
+
+    但在 PATCH 里 null 是"清空字段"的歧义输入，必须拒（test_null_position_*）。
+    同一个 None 在两处含义不同，这条把它们钉死。
+    """
+    a = create_idea("x")                      # 不传 position
+    assert a["position"] == 1
+    assert create_idea("y", position=None)["position"] == 2     # 空列自动分配
+    assert advance(a["id"], "clarifying")["position"] == 1     # clarifying 列也是空的
+    with pytest.raises(Invalid):
+        update_idea(a["id"], {"position": None})
+
+
+def test_position_column_never_holds_text(conn):
+    """TEXT 排在 REAL 之后，混进一列就足以让整列排序失真——库里不许出现。"""
+    for bad in ("abc", [1], True):
+        with pytest.raises(Invalid):
+            create_idea("t", position=bad)
+        with pytest.raises(Invalid):
+            advance(create_idea("u")["id"], "building", position=bad)
+    c = db.connect()
+    try:
+        kinds = [r[0] for r in c.execute("SELECT DISTINCT typeof(position) FROM ideas")]
+    finally:
+        c.close()
+    assert kinds == ["real"]
+
+
+def test_position_text_would_break_column_order(conn):
+    """钉住"为什么非数字要拒"：一张 TEXT 卡片会被顶到该列所有数字卡片之后。"""
+    for pos in (1.0, 2.0, 3.0):
+        create_idea("p%s" % pos, position=pos)
+    with pytest.raises(Invalid):
+        create_idea("坏卡", position="abc")
+    assert [x["title"] for x in list_ideas(status="idea")] == ["p1.0", "p2.0", "p3.0"]
 
 
 def test_null_and_type_errors_are_not_one_message(conn):
@@ -577,3 +626,60 @@ def test_whitelist_check_precedes_value_check(conn):
     with pytest.raises(Invalid) as ei:
         update_idea(a, {"status": 5})
     assert "不支持的字段" in ei.value.detail
+
+
+# --- 修复轮 3：null 守卫必须覆盖全字段，且独立于类型分档 ---------------------
+# 上一轮我把全字段 null 守卫换成了"跳过 position/tags 的类型循环"，等于开了
+# 两个洞：tags 静默清空（还写下"修改了 tags"的 event，账本说谎），position
+# 直接漏 IntegrityError。这两条把当时的 22/22 假象打穿了。
+
+
+@pytest.mark.parametrize("field", list(store.FIELDS))
+def test_null_rejected_for_every_whitelisted_field(field, conn):
+    """白名单里每一个字段传 null 都必须 Invalid——没有例外。"""
+    a = create_idea("seed")["id"]
+    with pytest.raises(Invalid) as ei:
+        update_idea(a, {field: None})
+    assert "不能为 null，请传空串" in ei.value.detail
+
+
+def test_null_tags_does_not_silently_clear(conn):
+    """回归锁：{"tags": null} 曾静默把标签清成 ","，还写下"修改了 tags"。"""
+    a = create_idea("种子", tags="视频,科普")
+    with pytest.raises(Invalid):
+        update_idea(a["id"], {"tags": None})
+    got = get_idea(a["id"])
+    assert got["tags"] == ",视频,科普,"                      # 库里的标签没被动过
+    assert [e["kind"] for e in got["events"]] == ["created"]   # 更不能写"修改了 tags"
+
+
+def test_null_position_does_not_leak_integrity_error(conn):
+    """回归锁：{"position": null} 曾漏出 NOT NULL constraint failed。"""
+    a = create_idea("种子")
+    before = get_idea(a["id"])["position"]
+    with pytest.raises(Invalid):
+        update_idea(a["id"], {"position": None})
+    got = get_idea(a["id"])
+    assert got["position"] == before
+    assert [e["kind"] for e in got["events"]] == ["created"]
+
+
+def test_null_guard_is_not_a_type_check(conn):
+    """null 守卫独立于类型分档：tags/position 的类型错与 null 错是两条不同文案。"""
+    a = create_idea("种子")["id"]
+    with pytest.raises(Invalid) as nul:
+        update_idea(a, {"tags": None})
+    with pytest.raises(Invalid) as typ:
+        update_idea(a, {"tags": 5})
+    assert "请传空串" in nul.value.detail
+    assert "请传空串" not in typ.value.detail
+
+
+def test_list_ideas_rejects_non_string_filters(conn):
+    """tag/q 传非字符串：tag 曾经拼成 "%,5,%" 静默返空，q 曾在 split() 抛异常。"""
+    for bad in (5, ["科普"], True):
+        with pytest.raises(Invalid):
+            list_ideas(tag=bad)
+        with pytest.raises(Invalid):
+            list_ideas(q=bad)
+    assert list_ideas(tag=None) == list_ideas()      # None = 不过滤，仍然合法

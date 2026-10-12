@@ -19,7 +19,7 @@ FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
 
 
 _FIELD_LABEL = {"title": "标题", "body": "描述", "source": "来源",
-                "tags": "标签", "blocked_note": "阻塞备注"}
+                "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置"}
 
 
 def _text(v, what):
@@ -36,6 +36,18 @@ def _text(v, what):
         raise Invalid("%s 不能为 null，请传空串" % what)
     if not isinstance(v, str):
         raise Invalid("%s 必须是字符串" % what)
+    return v
+
+
+def _num(v, what):
+    """position 是 REAL 列：非数字会被 SQLite 静默存成 TEXT。
+
+    而 TEXT 在 ORDER BY 里排在 REAL 之后，列内排序就此失真——实测一张
+    position='abc' 的卡片会被顶到该列所有数字卡片之后。bool 是 int 的子类，
+    position=True 会被当成 1，一并拒掉。
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise Invalid("%s 必须是数字" % what)
     return v
 
 
@@ -96,6 +108,8 @@ def create_idea(title, body="", tags=None, source="", actor="human", position=No
     body = _text(body, "描述")
     source = _text(source, "来源")
     tags_v = _parse_tags(tags)
+    if position is not None:
+        position = _num(position, _FIELD_LABEL["position"])
     c = db.connect()
     try:
         pos = _next_position(c, "idea") if position is None else position
@@ -119,9 +133,12 @@ def list_ideas(status=None, tag=None, q=None, blocked=None):
     if status:
         where.append("status=?"); args.append(status)
     if tag is not None:
-        where.append("tags LIKE ?"); args.append("%%,%s,%%" % tag)
+        # 不校验的话 tag=5 会拼成 "%,5,%" 静默返回空结果——无异常、无提示
+        where.append("tags LIKE ?"); args.append("%%,%s,%%" % _text(tag, "标签筛选"))
     if blocked is not None:
         where.append("blocked=?"); args.append(1 if blocked in (1, "1", True) else 0)
+    if q is not None:
+        q = _text(q, "搜索词")          # 否则 q=5 会在 q.split() 抛 AttributeError
     if q:
         for w in q.split():
             where.append("(title LIKE ? OR body LIKE ?)")
@@ -159,10 +176,18 @@ def update_idea(idea_id, fields, actor="human"):
     bad = [k for k in fields if k not in FIELDS]
     if bad:
         raise Invalid("不支持的字段：%s（状态请用 /advance）" % "、".join(bad))
+    # null 守卫覆盖全字段、无例外，且独立于下面的类型分档（SPEC 5.5）。
+    # tags/position 同样是 NOT NULL：放进类型循环里跳过它们等于开了两个洞——
+    # {"tags": null} 会静默清空标签并写下"修改了 tags"的 event（账本说谎），
+    # {"position": null} 则直接漏 IntegrityError。类型分档只对非 null 值生效。
+    nulls = [k for k, v in fields.items() if v is None]
+    if nulls:
+        raise Invalid("%s 不能为 null，请传空串" % _FIELD_LABEL.get(nulls[0], nulls[0]))
     for k, v in fields.items():
-        # position 是 REAL、tags 由 _parse_tags 独家处理，这俩不走文本校验
-        if k not in ("position", "tags"):
-            _text(v, _FIELD_LABEL.get(k, k))
+        if k == "position":
+            _num(v, _FIELD_LABEL["position"])      # REAL 列，不是文本字段
+        elif k != "tags":
+            _text(v, _FIELD_LABEL.get(k, k))      # tags 由 _parse_tags 独家处理
     if "tags" in fields:
         fields = dict(fields, tags=_parse_tags(fields["tags"]))
     c = db.connect()
@@ -183,6 +208,8 @@ def advance(idea_id, to, note=None, position=None, actor="agent"):
     if to not in db.STATUS_KEYS:
         raise Invalid("未知状态：%s（合法值：%s）" % (to, "、".join(db.STATUS_KEYS)))
     note = "" if note is None else _text(note, "备注")   # note=None 是合法缺省，不是错
+    if position is not None:
+        position = _num(position, _FIELD_LABEL["position"])
     c = db.connect()
     try:
         r = c.execute("SELECT status FROM ideas WHERE id=?", (idea_id,)).fetchone()
