@@ -477,6 +477,12 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'store'`
 
 - [ ] **Step 3: 写 `server/store.py`**
 
+> ⚠️ **Task 2 已完成并关闭。下面这段代码块是当初的参考实现，是历史快照，不是当前规格。**
+> 实际交付经过 3 轮修复（null 守卫、类型分档、CASE 列序），已与本块**不一致**——
+> 例如本块的 `list_ideas` 仍写着 `"%,%s,%%"`，那正是第一轮修掉的必崩 bug。
+> **以仓库里已提交的 `server/store.py` 为准**，并以 SPEC 第 4/5 节为契约。
+> 本块仅供追溯"当初打算怎么做"，**不要照抄**。
+
 ```python
 """数据访问层。纯数据操作，不感知 HTTP。
 
@@ -588,18 +594,17 @@ def update_idea(idea_id, fields, actor="human"):
     bad = [k for k in fields if k not in FIELDS]
     if bad:
         raise Invalid("不支持的字段：%s（状态请用 /advance）" % "、".join(bad))
-    if any(v is None for v in fields.values()):
-        # null 守卫全字段无例外（含 tags/position），独立于下面的类型分档
+    # null 守卫全字段无例外（含 tags/position），独立于下面的类型分档
     for k, v in fields.items():
         if v is None:
-            raise Invalid("%s 不能为 null，请传空串" % FIELD_LABEL.get(k, k))
+            raise Invalid("%s 不能为 null，请传空串" % _FIELD_LABEL.get(k, k))
     # 类型分档只对已确认非 null 的值生效
     for k, v in fields.items():
         if k == "position":
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise Invalid("排序位置 必须是数字")
         elif not isinstance(v, str):
-            raise Invalid("%s 必须是字符串" % FIELD_LABEL.get(k, k))
+            raise Invalid("%s 必须是字符串" % _FIELD_LABEL.get(k, k))
     if "tags" in fields:
         try:
             fields = dict(fields, tags=db.parse_tags(fields["tags"]))
