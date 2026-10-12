@@ -94,11 +94,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "server"))
 
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
-    """临时 db + 已建表的新连接。"""
+    """临时 db + 已建表的新连接。
+
+    不需要 pop/reimport：db.connect() 每次调用都经 db_path() 重新读 PANEL_DB。
+    """
     monkeypatch.setenv("PANEL_DB", str(tmp_path / "t.db"))
-    for mod in ("db", "store", "app"):
-        sys.modules.pop(mod, None)
-    db = importlib.import_module("db")
     db.init_db()
     return db.connect()
 
@@ -155,15 +155,21 @@ def test_now_iso_format():
 
 def test_check_constraints(conn):
     """15. 绕过 API 直接写非法值也被数据库拒绝。"""
-    import pytest as _p
-    with _p.raises(Exception):
+    with pytest.raises(Exception):
         conn.execute(
-            "INSERT INTO ideas(title,status,created_at,updated_at) VALUES('x','nope','t','t')")
-    with _p.raises(Exception):
+            "INSERT INTO ideas(title,status,created_at,updated_at)"
+            " VALUES('x','nope','t','t')")
+    conn.execute(
+        "INSERT INTO ideas(title,status,created_at,updated_at)"
+        " VALUES('ok','idea','t','t')")
+    with pytest.raises(Exception):   # kind 非法
         conn.execute(
-            "INSERT INTO ideas(title,status,created_at,updated_at) VALUES('x','idea','t','t')")
+            "INSERT INTO events(idea_id,kind,actor,created_at)"
+            " VALUES(1,'bogus','human','t')")
+    with pytest.raises(Exception):   # actor 非法
         conn.execute(
-            "INSERT INTO events(idea_id,kind,actor,created_at) VALUES(1,'bogus','human','t')")
+            "INSERT INTO events(idea_id,kind,actor,created_at)"
+            " VALUES(1,'note','robot','t')")
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -517,8 +523,6 @@ def create_idea(title, body="", tags=None, source="", actor="human", position=No
         tags_v = db.parse_tags(tags)
     except ValueError as e:
         raise Invalid(str(e))
-    if "," in (title or "") and False:
-        pass
     c = db.connect()
     try:
         pos = _next_position(c, "idea") if position is None else position
@@ -688,16 +692,12 @@ def stats():
         c.close()
 ```
 
-- [ ] **Step 4: 删掉 create_idea 里那段占位死代码**
-
-`create_idea` 中有 `if "," in (title or "") and False: pass` 这类无用分支，直接删除，不要留在代码里。
-
-- [ ] **Step 5: 跑测试确认通过**
+- [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest test_panel.py -q`
 Expected: PASS
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 5: 提交**
 
 ```bash
 git add server/store.py test_panel.py
@@ -733,10 +733,6 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("PANEL_DB", str(tmp_path / "c.db"))
-    for mod in ("db", "store", "app"):
-        sys.modules.pop(mod, None)
-    dbm = importlib.import_module("db")
-    dbm.init_db()
     appm = importlib.import_module("app")
     return TestClient(appm.create_app())
 
@@ -906,7 +902,9 @@ def create_app():
     def stats():
         return store.stats()
 
-    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+    # web/ 由 Task 5 创建；此前不挂载，避免 StaticFiles 因目录不存在而报错
+    if WEB_DIR.exists():
+        app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
     return app
 
 
@@ -961,8 +959,6 @@ def live_server(tmp_path, monkeypatch):
     port = sock.getsockname()[1]; sock.close()
     monkeypatch.setenv("PANEL_DB", str(tmp_path / "live.db"))
     monkeypatch.setenv("PANEL_URL", "http://127.0.0.1:%d" % port)
-    for mod in ("db", "store", "app"):
-        sys.modules.pop(mod, None)
     appm = importlib.import_module("app")
     cfg = uvicorn.Config(appm.create_app(), host="127.0.0.1", port=port, log_level="error")
     srv = uvicorn.Server(cfg)
