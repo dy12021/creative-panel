@@ -1,0 +1,153 @@
+/* 创意面板 —— 设计令牌 + 骨架样式（Task 5）
+ *
+ * 配色基准：本机 SnowLuma 的打包 CSS（client/assets/index-B1pFTpxb.css）的暗色
+ * 主题。已核过：SPEC 8.1 的 oklch(13% .008 250) 就是 SnowLuma 暗色 --card 的
+ * 原值，SPEC 8.2 的几个状态色也都能在该文件里逐个对上；本次只是按本项目需要
+ * 归一化到两位小数并重排了明度梯度。
+ *
+ * 硬约束：零 CDN。不下载字体、不引图标库、不引任何外链资源，断网必须完全可用。
+ */
+
+:root {
+  color-scheme: dark;   /* 原生控件（select / input / 滚动条）跟随暗色，否则下拉是白底 */
+
+  /* 8.1 底色：单色冷灰，全部 hue 250，彩度极低 */
+  --bg:      oklch(13% .008 250);
+  --panel:   oklch(15% .01  250);
+  --card:    oklch(17% .012 250);
+  --lift:    oklch(19% .012 250);
+  --border:  oklch(20% .03  250 / .28);
+  --fg:      oklch(98% .005 240);
+  --fg-dim:  oklch(66% .02  240);
+
+  /* 8.2 状态色：灰 -> 冷 -> 冷紫 -> 暖 -> 绿。红色全部留给阻塞。 */
+  --st-idea:       oklch(66% .02  240);
+  --st-clarifying: oklch(75% .14  230);
+  --st-clarified:  oklch(70% .18  293);
+  --st-building:   oklch(80% .16  80);
+  --st-done:       oklch(72% .15  160);
+  --blocked:       oklch(62% .2   27);
+
+  /* 8.7 / 8.8 */
+  --r: 1rem;                        /* radius-2xl */
+  --shadow: 0 1px 2px rgba(0,0,0,.15);
+  --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: .84rem;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1 { font-size: 1.05rem; letter-spacing: -.025em; margin: 0; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+
+:focus-visible { outline: 2px solid var(--st-clarified); outline-offset: 2px; }
+
+/* 暗色底上的默认亮色滚动条很难看，跟本机 media-center-pms 的做法一致 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: oklch(30% .02 250); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ------------------------------------------------------------- 工具条 */
+
+.toolbar {
+  display: flex; gap: .75rem; align-items: center; padding: .75rem 1rem;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.toolbar input[type=search] {
+  flex: 0 0 16rem; background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r); padding: .4rem .6rem;
+}
+.toolbar select {
+  background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r); padding: .4rem .6rem;
+}
+.toolbar .toggle { display: flex; align-items: center; gap: .35rem; color: var(--fg-dim); }
+.toolbar .primary {
+  margin-left: auto; background: var(--st-clarified); color: var(--bg);
+  border: 0; border-radius: var(--r); padding: .45rem .9rem; font-weight: 600;
+}
+
+/* ------------------------------------------------------------- 五列看板 */
+
+/* 8.4：统计数字直接做列头的 mono 大数字，不单占一行 */
+.board {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .75rem;
+  padding: .75rem; align-items: start; min-height: calc(100vh - 3.4rem);
+}
+.col {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: .6rem; min-height: 8rem;
+}
+.col-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .6rem; }
+.col-count { font-family: var(--mono); font-size: 1.5rem; line-height: 1; color: var(--fg); }
+.col-name { color: var(--fg-dim); }
+.col-list { display: flex; flex-direction: column; gap: .5rem; min-height: 2rem; }
+.col-add {
+  width: 100%; margin-top: .5rem; background: transparent; color: var(--fg-dim);
+  border: 1px dashed var(--border); border-radius: var(--r); padding: .35rem;
+}
+.col-add:hover { color: var(--fg); border-color: var(--fg-dim); }
+/* Task 7 拖拽时给目标列加的提示态 */
+.col.drop-hint { outline: 2px dashed var(--fg-dim); outline-offset: -2px; }
+
+/* ------------------------------------------------------------- 卡片
+ *
+ * 8.3 的签名元素（卡片左缘 5 段竖直流转轨）由 Task 6 接入 .rail，
+ * 本任务不画。这里只把卡片本体与元信息的样式铺好。 */
+
+.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--r);
+  padding: .55rem .6rem; box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: .4rem;
+}
+.card:hover { background: var(--lift); }
+/* 5.6：blocked_note 是快照，卡片上只在真的卡住时给信号 */
+.card.is-blocked { border-color: var(--blocked); }
+.card.is-blocked .card-title { color: var(--fg-dim); }
+.card.dragging { opacity: .4; }
+
+.card-title { font-size: .9rem; overflow-wrap: anywhere; }
+.card-meta { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
+.card-id { font-family: var(--mono); color: var(--fg-dim); font-size: .75rem; }
+.tag {
+  font-size: .7rem; color: var(--fg-dim); background: var(--panel);
+  border-radius: 999px; padding: .05rem .45rem;
+}
+.tag.is-blocked-tag {
+  color: var(--blocked); background: transparent;
+  border: 1px solid var(--blocked);
+}
+
+/* ------------------------------------------------------------- 读数失败的兜底 */
+
+.boot-error {
+  grid-column: 1 / -1; border: 1px solid var(--border);
+  border-radius: var(--r); background: var(--panel); padding: 1rem;
+}
+.boot-error-title { margin: 0 0 .35rem; }
+.boot-error-hint { margin: 0; color: var(--fg-dim); }
+
+/* ------------------------------------------------------------- 抽屉（Task 6/7 填充）
+
+   .drawer 的完整样式在 Task 6 追加。这里必须先把 hidden 语义钉住：
+   作者样式里的 display 会盖过浏览器默认的 [hidden]{display:none}，
+   少了这一行，抽屉在 Task 6 追加样式之前会直接盖满整个视口。 */
+.drawer[hidden] { display: none; }
+
+/* 8.6：动效只做一处（Task 6 的流转轨滑动），其余一律不加；并全部服从
+   prefers-reduced-motion。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}

@@ -1023,9 +1023,19 @@ def test_stats_endpoint(client):
         "blocked": 1}
 
 
-def test_create_app_works_before_web_dir_exists(client):
-    """web/ 要到 Task 5 才建；目录不存在时 StaticFiles 会当场抛错。"""
-    assert client.get("/").status_code == 404
+def test_create_app_survives_missing_web_dir(tmp_path, monkeypatch):
+    """web/ 缺失时 create_app() 不能炸——StaticFiles 会对不存在的目录当场抛错。
+
+    原断言靠"仓库里还没有 web/"来满足前提，Task 5 把 web/ 建出来之后它就永远
+    不成立了（`GET /` 会变成 200）。改用 monkeypatch 指向一个不存在的目录，
+    锁的仍然是 app.py 里那行 exists() 守卫本身，覆盖面没变窄。
+    """
+    appm = importlib.import_module("app")
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "m.db"))
+    monkeypatch.setattr(appm, "WEB_DIR", tmp_path / "nope")
+    c = TestClient(appm.create_app())
+    assert c.get("/api/health").status_code == 200   # 服务照常起来
+    assert c.get("/").status_code == 404              # 只是没有页面可发
 
 
 def test_web_dir_mount_does_not_shadow_api(tmp_path, monkeypatch):
