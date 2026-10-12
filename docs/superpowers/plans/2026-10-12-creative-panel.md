@@ -589,7 +589,17 @@ def update_idea(idea_id, fields, actor="human"):
     if bad:
         raise Invalid("不支持的字段：%s（状态请用 /advance）" % "、".join(bad))
     if any(v is None for v in fields.values()):
-        raise Invalid("字段不能为 null，请传空串")
+        # null 守卫全字段无例外（含 tags/position），独立于下面的类型分档
+    for k, v in fields.items():
+        if v is None:
+            raise Invalid("%s 不能为 null，请传空串" % FIELD_LABEL.get(k, k))
+    # 类型分档只对已确认非 null 的值生效
+    for k, v in fields.items():
+        if k == "position":
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise Invalid("排序位置 必须是数字")
+        elif not isinstance(v, str):
+            raise Invalid("%s 必须是字符串" % FIELD_LABEL.get(k, k))
     if "tags" in fields:
         try:
             fields = dict(fields, tags=db.parse_tags(fields["tags"]))
