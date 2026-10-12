@@ -18,11 +18,51 @@ class Invalid(Exception):
 FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
 
 
+def _not_null(v, what):
+    """null 一律拒（SPEC 5.1：清空请传空串）。
+
+    ideas.body/source/blocked_note 与 events.actor/message 都是 NOT NULL 列，
+    漏下去就是 sqlite3.IntegrityError -> Task 3 返 500 而不是 422。
+    """
+    if v is None:
+        raise Invalid("%s 不能为 null，清空请传空字符串" % what)
+    return v
+
+
+def _parse_tags(raw):
+    """把 db.parse_tags 的所有失败收敛成 Invalid。
+
+    ValueError 是"提供了但规范化后全空"；TypeError/AttributeError 是
+    传了非字符串（JSON 里 {"tags": 5} 就会走到后者）。
+    """
+    try:
+        return db.parse_tags(raw)
+    except ValueError as e:
+        raise Invalid(str(e))
+    except (TypeError, AttributeError):
+        raise Invalid("标签必须是逗号分隔的字符串")
+
+
+def _board_order():
+    """看板列序取自 db.STATUS_KEYS，不硬编码；返回 (SQL 片段, 绑定参数)。
+
+    不能直接 ORDER BY status——那是字典序，会把 building 排到 idea 前面，
+    CLI 的 list 输出看起来是乱的。列序由 db.STATUS_KEYS 定义，这里现算而不是
+    模块级缓存，免得改了看板列序这边静默失效。
+    """
+    return ("CASE status " + " ".join("WHEN ? THEN ?" for _ in db.STATUS_KEYS)
+            + " END",
+            [x for i, k in enumerate(db.STATUS_KEYS) for x in (k, i)])
+
+
 def _row(c, r):
     return {k: r[k] for k in r.keys() if k != "events"}
 
 
 def add_event(c, idea_id, kind, actor, message="", from_status=None, to_status=None):
+    # actor/message 走这里的是所有事件类写入口，统一在收口处挡 null
+    actor = _not_null(actor, "actor")
+    message = _not_null(message, "事件内容")
     c.execute(
         "INSERT INTO events(idea_id,kind,from_status,to_status,actor,message,created_at)"
         " VALUES(?,?,?,?,?,?,?)",
@@ -40,10 +80,9 @@ def _next_position(c, status):
 def create_idea(title, body="", tags=None, source="", actor="human", position=None):
     if not (title or "").strip():
         raise Invalid("标题不能为空")
-    try:
-        tags_v = db.parse_tags(tags)
-    except ValueError as e:
-        raise Invalid(str(e))
+    body = _not_null(body, "描述")
+    source = _not_null(source, "来源")
+    tags_v = _parse_tags(tags)
     c = db.connect()
     try:
         pos = _next_position(c, "idea") if position is None else position
@@ -77,7 +116,9 @@ def list_ideas(status=None, tag=None, q=None, blocked=None):
     sql = "SELECT * FROM ideas"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY status, position, id"      # 11. tie-breaker
+    case_sql, case_args = _board_order()
+    sql += " ORDER BY " + case_sql + ", position, id"   # 11. tie-breaker
+    args += case_args
     c = db.connect()
     try:
         return [_row(c, r) for r in c.execute(sql, args)]
@@ -108,10 +149,7 @@ def update_idea(idea_id, fields, actor="human"):
     if any(v is None for v in fields.values()):
         raise Invalid("字段不能为 null，请传空串")
     if "tags" in fields:
-        try:
-            fields = dict(fields, tags=db.parse_tags(fields["tags"]))
-        except ValueError as e:
-            raise Invalid(str(e))
+        fields = dict(fields, tags=_parse_tags(fields["tags"]))
     c = db.connect()
     try:
         if not c.execute("SELECT 1 FROM ideas WHERE id=?", (idea_id,)).fetchone():
@@ -163,6 +201,7 @@ def add_note(idea_id, message, actor="agent"):
 
 def block(idea_id, reason, actor="agent"):
     """允许重复：覆盖 note，每次都留痕（SPEC 5.6）。"""
+    reason = _not_null(reason, "阻塞原因")   # 必须在 UPDATE 之前挡，否则撞 NOT NULL
     c = db.connect()
     try:
         if not c.execute("SELECT 1 FROM ideas WHERE id=?", (idea_id,)).fetchone():

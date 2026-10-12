@@ -382,14 +382,8 @@ def test_status_event_records_from_and_to(conn):
                for e in evs if e["kind"] == "created")
 
 
-def test_list_ideas_groups_by_status_then_position(conn):
-    """同列内按 position, id 排；跨列时同一列的卡片必须连续。
-
-    注意 ORDER BY 里的 status 是**字典序**（building<clarified<clarifying<
-    done<idea），不是看板列序 idea→clarifying→…→done。前端 web/app.js 自带
-    STATUS_ORDER 自行分桶，所以不影响渲染——但下层不该被误读成"已按列序排好"。
-    真要按看板列序排必须显式 CASE，不能依赖字典序。
-    """
+def test_list_ideas_orders_by_board_column_then_position(conn):
+    """跨列按看板列序 idea→…→done（不是字典序）；列内按 position, id。"""
     a = create_idea("a")
     b = create_idea("b")
     c = create_idea("c")
@@ -397,5 +391,89 @@ def test_list_ideas_groups_by_status_then_position(conn):
     advance(b["id"], "building")
     update_idea(a["id"], {"position": 5.0})          # 列内把 a 挪到 b 后面
     got = list_ideas()
-    assert [x["id"] for x in got] == [b["id"], a["id"], c["id"]]
-    assert [x["status"] for x in got] == ["building", "building", "idea"]
+    assert [x["status"] for x in got] == ["idea", "building", "building"]
+    assert [x["id"] for x in got] == [c["id"], b["id"], a["id"]]
+
+
+def test_all_five_columns_come_back_in_board_order(conn):
+    """字典序会把 building 排到 idea 前面——这条把看板列序钉死。
+
+    done 最后建、idea 最先建，纯粹为了让"按 id 排"和"按列序排"给出不同答案。
+    """
+    first = create_idea("仅创意")["id"]
+    rest = {}
+    for to in ("clarifying", "clarified", "building", "done"):
+        cid = create_idea(to)["id"]
+        advance(cid, to)
+        rest[to] = cid
+    assert [x["id"] for x in list_ideas()] == [first] + [
+        rest[t] for t in ("clarifying", "clarified", "building", "done")]
+
+
+def test_board_order_follows_status_keys(conn, monkeypatch):
+    """列序必须跟着 db.STATUS_KEYS 走，不能硬编码。
+
+    否则改了看板列序，这里会静默按旧顺序返回——正好是字典序那条坑的复发形态。
+    """
+    a = create_idea("a")
+    b = create_idea("b")
+    advance(a["id"], "building")
+    monkeypatch.setattr(db, "STATUS_KEYS", ["building", "idea"])
+    assert [x["id"] for x in list_ideas()] == [a["id"], b["id"]]
+
+
+# --- 修复轮 1：null 与非字符串入参不得漏出 sqlite3 异常 ----------------------
+# NOT NULL 列漏下去是 IntegrityError -> Task 3 返 500 而不是 422。
+
+
+@pytest.mark.parametrize("bad", [5, ["视频"], {"视频": 1}, True, b"v"])
+def test_non_string_tags_raise_invalid(bad, conn):
+    with pytest.raises(Invalid):
+        create_idea("x", tags=bad)
+    a = create_idea("y")
+    with pytest.raises(Invalid):
+        update_idea(a["id"], {"tags": bad})
+
+
+def test_blank_tags_message_still_human(conn):
+    """ValueError 那条不能被 I2 的新 except 吃掉——"标签不能为空"是 SPEC 文案。"""
+    with pytest.raises(Invalid) as ei:
+        create_idea("x", tags=" , ")
+    assert "标签不能为空" in ei.value.detail
+
+
+@pytest.mark.parametrize("call", [
+    lambda i: create_idea("x", body=None),
+    lambda i: create_idea("x", source=None),
+    lambda i: create_idea("x", actor=None),
+    lambda i: add_note(i, None),
+    lambda i: add_note(i, "n", actor=None),
+    lambda i: block(i, None),
+    lambda i: block(i, "r", actor=None),
+    lambda i: unblock(i, actor=None),
+])
+def test_null_params_raise_invalid(call, conn):
+    a = create_idea("seed")["id"]
+    with pytest.raises(Invalid):
+        call(a)
+
+
+def test_rejected_null_leaves_no_partial_state(conn):
+    """block(reason=None) 必须在 UPDATE 之前就拒——不能先把 blocked 改了再报错。"""
+    a = create_idea("x")
+    with pytest.raises(Invalid):
+        block(a["id"], None)
+    got = get_idea(a["id"])
+    assert got["blocked"] == 0 and got["blocked_note"] == ""
+    assert [e["kind"] for e in got["events"]] == ["created"]
+    with pytest.raises(Invalid):
+        add_note(a["id"], None)
+    assert len(get_idea(a["id"])["events"]) == 1
+
+
+def test_empty_string_still_allowed(conn):
+    """null 被拒不代表空串被拒——block(reason="") 必须照常成功。"""
+    a = create_idea("x")
+    assert block(a["id"], "")["blocked_note"] == ""
+    assert add_note(a["id"], "")["events"][-1]["message"] == ""
+    assert create_idea("y", body="", source="")["body"] == ""
