@@ -87,8 +87,12 @@ def init_db():
 
 
 def now_iso():
-    """毫秒精度、无时区（SPEC 4.3）。"""
-    c = connect()
+    """毫秒精度、无时区（SPEC 4.3）。
+
+    只需要一个纯 SQLite 标量函数，不碰文件系统——用 :memory: 而不是走
+    connect()，免得为了取时间戳去 mkdir + 建库，顺手污染真实 data/panel.db。
+    """
+    c = sqlite3.connect(":memory:")
     try:
         return c.execute(
             "SELECT strftime('%Y-%m-%dT%H:%M:%f','now','localtime')").fetchone()[0]
