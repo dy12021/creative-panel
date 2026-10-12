@@ -23,7 +23,8 @@
 - **`PATCH` 白名单**：`title` `body` `tags` `source` `blocked_note` `position`；出现其他键（含 `status`/`blocked`/`id`）一律 422
 - **任一字段传 `null`** → 422；清空请传 `""`
 - **`advance` 到当前状态** → 422
-- **排序一律 `ORDER BY position, id`**
+- **排序键**：`ORDER BY <按看板列序的 status>, position, id`。`status` 用 `CASE` 按 `idea→clarifying→clarified→building→done` 排（不用字典序，否则 CLI `list` 输出会乱），`CASE` 取值从 `db.STATUS_KEYS` 生成不硬编码；`id` 是 tie-breaker
+- **tags 逗号语义**：逗号是分隔符，"标签含逗号"不可表达，不为它写校验分支
 - **tags 存储形式**：首尾补逗号，如 `",视频,科普,"`；标签禁止含逗号；未提供 → `","`；提供了但规范化后全空 → 422
 - **`position` 由前端计算，服务端只存不校验**；新建缺省 `COALESCE(MAX(position),0)+1`
 - **时间戳**：`strftime('%Y-%m-%dT%H:%M:%f','now','localtime')`，毫秒、无时区
