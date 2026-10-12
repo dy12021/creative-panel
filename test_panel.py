@@ -261,16 +261,54 @@ def test_filters(conn):
 
 
 def test_position_ordering_and_tiebreak(conn):
-    """11/12. 新建 position 递增；同值按 id。"""
+    """11/12. 新建 position 递增；同值按 id。
+
+    **同值那一段改用裸 SQL 摆位，理由不是绕开重排，是同值状态在走 API 时
+    已经造不出来了。** SPEC 4.2 要求"插入位置与相邻卡片的 position 差值小于
+    1e-10 就整列重排"，而"与邻居完全同值"的差值就是 0，0 < 1e-10 —— 所以
+    写进去的瞬间就被重排掉了。这是 SPEC 自己的两条要求在"精确重复"这个输入
+    上的碰撞，不是实现跑偏。
+
+    那 id tie-breaker 还要不要锁？要。它锁的是**读数**口径
+    （`ORDER BY position, id`），而 position 相等的状态在库里依然可能存在：
+    旧数据、别的客户端、或直接写库。裸 SQL 摆出来的同值正是这个场景，
+    断言的仍然是 SPEC 11 第 11 条本身。
+    """
     a = create_idea("a"); c = create_idea("b"); e = create_idea("c")
     assert [x["id"] for x in list_ideas(status="idea")] == [a["id"], c["id"], e["id"]]
     # position 必须真正参与排序：99 比 2、3 都大，a 应当落到末尾
     update_idea(a["id"], {"position": 99.0})
     assert [x["id"] for x in list_ideas(status="idea")] == [c["id"], e["id"], a["id"]]
-    # 三条同值时由 id 兜底，顺序必须稳定
+    # 三条同值时由 id 兜底，顺序必须稳定（裸 SQL 摆位，见 docstring）
     for x in (a, c, e):
-        update_idea(x["id"], {"position": 0.0})
+        conn.execute("UPDATE ideas SET position=0.0 WHERE id=?", (x["id"],))
+    conn.commit()
     assert [x["id"] for x in list_ideas(status="idea")] == [a["id"], c["id"], e["id"]]
+
+
+def test_writing_an_exact_duplicate_now_renumbers(conn):
+    """写一个与邻居**完全同值**的 position：不留同值，而是按 SPEC 4.2 重排。
+
+    这条是 `test_position_ordering_and_tiebreak` 改成裸 SQL 摆位之后，
+    必须另有一条把"为什么走 API 造不出同值"钉住——否则下一个人看到那条测试
+    改了就以为同值是能通过接口写出来的。差值 0 属于"小于 1e-10"，所以触发重排。
+
+    同时验证**相对顺序不变**：重排前后都是 a、c、e。邻居比较用的是
+    (position, id) 两段键，和列内读数口径一致，所以不会把谁甩到后面去。
+    """
+    a = create_idea("a")["id"]; c = create_idea("b")["id"]; e = create_idea("c")["id"]
+    _force_position(conn, a, 0.0)
+    _force_position(conn, e, 0.0)
+    # c 还拿着自动分配的 2.0；a 与 e 同为 0.0，按 id 兜底 a 在 e 之前，
+    # 两张 0.0 都排在 2.0 前面 —— 顺序是 [a, e, c]
+    assert [(x["id"], x["position"]) for x in list_ideas(status="idea")] == [
+        (a, 0.0), (e, 0.0), (c, 2.0)]
+
+    update_idea(c, {"position": 0.0})       # 与邻居差值 0 -> 触发重排
+    got = list_ideas(status="idea")
+    # c 的 id 落在 a、e 之间，重排后仍该留在原处：顺序不变，只是位置被拉开
+    assert [x["id"] for x in got] == [a, c, e], "重排不得打乱相对顺序"
+    assert len({x["position"] for x in got}) == 3, "重排后不得再有同值"
 
 
 def test_delete_cascades_events(conn):
@@ -1713,3 +1751,268 @@ def test_cli_empty_title_is_human(live_server):
     r = _cli("new", "")
     assert r.returncode == 1 and "标题不能为空" in r.stdout
     assert "Traceback" not in r.stdout + r.stderr
+
+
+# ==========================================================================
+# Task 6.5：审计用变异测试实证出的契约缺口，逐条补上回归锁
+# ==========================================================================
+
+
+DB_PY = Path(__file__).parent / "server" / "db.py"
+
+
+def test_pragmas_are_written_in_source(conn):
+    """G1 + G5：三条 PRAGMA 语句必须在 db.py 源码里真的写着。
+
+    为什么值断言不够（这正是"读回断言天然证明不了语句存在"的原因）：
+
+    - `journal_mode=WAL`：连 journal_mode 都不查，就没有值可断言。整行删掉，
+      254 条测试全绿——它只在并发写时才起作用，本机单进程测试根本触发不到。
+    - `recursive_triggers=OFF`：**SQLite 的默认值本来就是 OFF**。所以
+      `PRAGMA recursive_triggers` 读回 0 这条断言，语句删掉照样成立——它是被
+      默认值满足的。反方向才有锁：改成 ON 会红。也就是说这条断言锁住的是"值"，
+      不是"写了这一句"。而 SPEC 4.3.1 说它是**硬性前提，必须有回归锁**。
+
+    所以这里补一条源码级断言。**这是有意为之，不是偷懒**：值断言对
+    recursive_triggers 存在一个方向上的盲区（默认值替它兜住了），
+    源码断言补的正是那个盲区。两者并存，不要因为"有源码断言了"就删掉值断言——
+    值断言锁的是运行时真的生效（连接可能被别处改过），源码断言锁的是语句在。
+    """
+    src = DB_PY.read_text(encoding="utf-8")
+    # 只认真正执行的语句：db.connect() 里 execute 的那个字符串字面量。
+    # 用 ast 而不是正则，免得注释里提一句"PRAGMA xxx"就蒙混过关。
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "connect")
+    executed = {n.value.strip() for n in ast.walk(fn)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value.strip().upper().startswith("PRAGMA")}
+    assert "PRAGMA foreign_keys=ON" in executed
+    assert "PRAGMA recursive_triggers=OFF" in executed
+    assert "PRAGMA journal_mode=WAL" in executed
+
+
+def test_recursive_triggers_statement_removing_would_be_caught(conn):
+    """G5 的对照组：证明上面那条源码断言真的会因为语句消失而变红。
+
+    与其相信它会红，不如当场验一次。做法是把 db.py 的源码原样复制到一个临时目录
+    跑一遍解析——**不碰真 db.py**（那是唯一不许改字节的文件）。
+    """
+    import tempfile
+    src = DB_PY.read_text(encoding="utf-8")
+    # 删掉 recursive_triggers 那一行，其余原样
+    mutated = re.sub(r"^\s*c\.execute\(\"PRAGMA recursive_triggers=OFF\"\).*$\n",
+                     "", src, flags=re.M)
+    assert mutated != src, "变异本身没生效，测的是原文件——先怀疑这行正则"
+
+    def executed_in(text):
+        fn = next(n for n in ast.walk(ast.parse(text))
+                  if isinstance(n, ast.FunctionDef) and n.name == "connect")
+        return {n.value.strip() for n in ast.walk(fn)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value.strip().upper().startswith("PRAGMA")}
+
+    assert "PRAGMA recursive_triggers=OFF" in executed_in(src)
+    assert "PRAGMA recursive_triggers=OFF" not in executed_in(mutated)
+
+
+# --- G2：position 浮点耗尽重排（SPEC 4.2，全项目既无代码也无测试）---------
+
+
+def _positions(conn):
+    """回读全表 (id, status, position)，按落点排序。"""
+    return [(r["id"], r["status"], r["position"]) for r in conn.execute(
+        "SELECT id, status, position FROM ideas ORDER BY position, id")]
+
+
+def _force_position(conn, idea_id, pos):
+    """绕过 store 直接摆 position——**造"耗尽"地形必须这么干**。
+
+    走 API 是造不出来的：把一张卡设到离邻居不足 1e-10 的位置，那次写入自己就
+    触发了重排，地形当场被抹平（第一次写测试时就踩了这个：设 b 的过程先把
+    a、b 一起重排成 1、2，断言读到的是重排后的值）。
+    真实世界里这个地形是长期反复插中点拖出来的，不是某一次写入的结果，
+    所以用裸 SQL 摆出来才是忠实的模拟。
+    """
+    conn.execute("UPDATE ideas SET position=? WHERE id=?", (pos, idea_id))
+    conn.commit()
+
+
+def test_position_midpoint_triggers_renumber(conn):
+    """落点与相邻卡差值 < 1e-10 时，整列重写为 1,2,3,…（SPEC 4.2）。
+
+    先用裸 SQL 摆出"耗尽"地形：一张卡 position=0，另一张 5e-11——人眼看是同一个
+    点，但按 (position, id) 排序它们仍然是两张有先后的卡。
+    """
+    a = create_idea("前卡")["id"]
+    b = create_idea("后卡")["id"]
+    _force_position(conn, a, 0.0)
+    _force_position(conn, b, 5e-11)
+
+    # 从 0.0 起算 2.5e-11：与两张卡的差值都 < 1e-10，触发重排
+    c = create_idea("插进来的", position=2.5e-11)["id"]
+    conn.commit()
+
+    got = _positions(conn)
+    assert [g[0] for g in got] == [a, c, b], "落点必须在两张卡中间，不能被重写冲掉"
+    # 重排把**既有**两卡写成 1、2，插进来的这张取新邻居的中点 1.5。
+    # 注意不是 1,2,3：新卡的 position 是算出来的，不是排出来的——
+    # 它一旦也写成整数，下次插中点又得重排，白折腾一轮。
+    assert [g[2] for g in got] == [1.0, 1.5, 2.0], "该列应被重写为 1,2，新卡取中点"
+
+
+def test_position_gap_exactly_at_threshold_does_not_renumber(conn):
+    """阈值是**严格小于**（SPEC 4.2 原文「小于 1e-10」），等于不触发。
+
+    造相等差值时不能写 1.0 + 1e-10 - 1.0：浮点下那个减法会得到
+    1.000000082740371e-10，比 1e-10 大一点点，于是"没重排"是因为差值真的大了，
+    而不是因为等于——这条测试就是恒真的假绿。从 0.0 起算才精确：
+    abs(0.0 - 1e-10) == 1e-10，一位不差。
+
+    邻居只留一个在阈值上：另一张放远点（3.0）。两张都贴 1e-10 时，落点与其中
+    一张的差值是 0（不是 1e-10），min 取到 0，重排照样该触发——那是另一回事。
+    """
+    a = create_idea("前卡")["id"]
+    b = create_idea("后卡")["id"]
+    _force_position(conn, a, 0.0)
+    _force_position(conn, b, 3.0)          # 远卡：只让 a 构成"恰好等于阈值"的邻居
+    assert abs(1e-10 - 0.0) == 1e-10, "前提不成立：这两个值在浮点下不相等"
+
+    # 落点与 a 的差值恰好等于阈值，与 b 的差值很大 -> 不该重排
+    c = create_idea("插进来的", position=1e-10)["id"]
+    conn.commit()
+    got = {g[0]: g[2] for g in _positions(conn)}
+    assert got[a] == 0.0 and got[b] == 3.0, "恰好等于阈值时不得重排"
+    assert got[c] == 1e-10
+
+
+def test_renumber_only_touches_its_own_column(conn):
+    """只重写该列——别的列的 position 一位都不能动。"""
+    a = create_idea("A")["id"]
+    b = create_idea("B")["id"]
+    _force_position(conn, a, 0.0)
+    _force_position(conn, b, 5e-11)
+    # 另一列：先摆成耗尽地形，再放一张无关卡记下它的 position
+    other = create_idea("别的列")["id"]
+    advance(other, "building")
+    o2 = create_idea("别的列2")["id"]
+    advance(o2, "building", position=7.25)
+    conn.commit()
+
+    create_idea("插进来的", position=2.5e-11)
+    conn.commit()
+
+    got = {g[0]: (g[1], g[2]) for g in _positions(conn)}
+    assert got[other][1] == 1, "被重排的是目标列"
+    assert got[o2][1] == 7.25, "无关列的 position 不能被连坐"
+
+
+def test_renumber_writes_no_extra_events(conn):
+    """重排是内部维护动作，不是用户编辑——时间线上不该凭空多出记录。"""
+    a = create_idea("A")["id"]
+    b = create_idea("B")["id"]
+    _force_position(conn, a, 0.0)
+    _force_position(conn, b, 5e-11)
+    conn.commit()
+    before = len(get_idea(a)["events"]) + len(get_idea(b)["events"])
+
+    create_idea("插进来的", position=2.5e-11)
+    conn.commit()
+
+    after = len(get_idea(a)["events"]) + len(get_idea(b)["events"])
+    assert after == before, "重排不得给别人的卡片写 event"
+
+
+def test_patch_position_triggers_renumber(conn):
+    """列内移动（PATCH {position}）同样要走重排——三条写入路径缺一条就等于没做。
+
+    这条是补变异验证发现的：把 update_idea 里的 _settle_position 调用删掉，
+    原有四条重排测试**全绿**（它们都走 create 路径）。前端列内拖拽发的正是
+    PATCH，漏掉它等于 SPEC 4.2 的承诺在最常用的路径上是空的。
+    """
+    a = create_idea("A")["id"]
+    b = create_idea("B")["id"]
+    c = create_idea("C")["id"]
+    _force_position(conn, a, 0.0)
+    _force_position(conn, b, 5e-11)
+    _force_position(conn, c, 9.0)      # C 挪到最前面，落点与 a 的差值 2.5e-11
+
+    update_idea(c, {"position": 2.5e-11})
+    conn.commit()
+
+    got = _positions(conn)
+    assert [g[0] for g in got] == [a, c, b], "列内移动后 C 应落在 a 与 b 之间"
+    assert [g[2] for g in got] == [1.0, 1.5, 2.0], "PATCH 路径同样要触发重排"
+
+
+def test_renumber_excludes_the_card_being_moved(conn):
+    """重排必须把"正在移动的那张"排除在外，否则它会把自己算成自己的邻居。
+
+    关键在于场景：**被移动的卡自己就躺在耗尽区里**（c 在 0.0 与 b 的 5e-11 之间）。
+    这时若不排除 c，找"落点两侧邻居"会选中 c 自己，而重排结果表里偏偏没有 c
+    （它马上要按新落点写），于是查表炸掉——顺序错乱之外还多一个 500。
+
+    换句话说：排除不是为了"重排时别动它"，而是为了**邻居不能是它自己**。
+    这条也是补变异验证时才发现写错的——第一版把 c 摆在 9.0（耗尽区之外），
+    那种场景下排除与否结果完全相同，测了等于没测。
+    """
+    a = create_idea("A")["id"]              # 0.0
+    c = create_idea("C")["id"]              # 5e-11，正落在耗尽区里
+    b = create_idea("B")["id"]              # 1.0
+    _force_position(conn, a, 0.0)
+    _force_position(conn, c, 5e-11)
+    _force_position(conn, b, 1.0)
+
+    # 把 c 挪到 0.0 与 5e-11 之间的落点上——它的旧邻居正是耗尽区
+    update_idea(c, {"position": 2.5e-11})
+    conn.commit()
+
+    got = {g[0]: g[2] for g in _positions(conn)}
+    assert got[a] == 1.0 and got[b] == 2.0, "重排只该改写除移动卡以外的卡"
+    assert got[c] == 1.5, "移动中的卡取新邻居的中点"
+
+
+# --- G3：CLI list --tag / --q 零覆盖 -------------------------------------
+
+
+def _new_with_tags(title, tags):
+    """建一张带标签的卡并回传 id——没有单独的改标签命令，标签只能在 new 时给。"""
+    r = _cli("new", title, "--tags", tags)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout.split("#")[1].split("「")[0]
+
+
+def test_cli_list_tag_filter_actually_filters(live_server):
+    """`--tag` 与 `--status` 是同一类静默失效：把 "tag": a.tag 整个删掉，
+    退出码照样 0、输出照样"看着对"，只是多了几条不该在的卡。
+
+    对照组不可省：不带 --tag 时两张卡都必须在，否则"没出现"可能只是因为
+    压根没建出来，整句断言就恒真了。
+    """
+    keep = _new_with_tags("构图那张", "构图,动效")
+    drop = _new_with_tags("动效那张", "音频")
+    r = _cli("list", "--tag", "构图")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "构图那张" in r.stdout
+    assert "动效那张" not in r.stdout
+
+    both = _cli("list")
+    assert "构图那张" in both.stdout and "动效那张" in both.stdout
+    assert store.get_idea(keep)["tags"] == ",构图,动效,"   # 前提：标签真落库了
+
+
+def test_cli_list_q_filter_actually_filters(live_server):
+    """`--q` 同理：删掉 "q": a.q 六条 CLI 测试全绿，筛选静默失效。
+
+    特意挑一个只出现在标题里的词：--q 是 title/body 各做一次子串匹配
+    （SPEC 5.3），只命中标题才算真的传到了服务端。
+    """
+    keep = _new_id("分镜表初稿")
+    drop = _new_id("配乐调研")
+    r = _cli("list", "--q", "分镜")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "分镜表初稿" in r.stdout
+    assert "配乐调研" not in r.stdout
+
+    both = _cli("list")
+    assert "分镜表初稿" in both.stdout and "配乐调研" in both.stdout

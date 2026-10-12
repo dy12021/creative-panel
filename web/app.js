@@ -1,11 +1,10 @@
-/* 创意面板前端 —— 数据层 + 五列看板 + 流转轨（Task 5 / Task 6）
+/* 创意面板前端 —— 数据层 + 五列看板 + 流转轨 + 抽屉与拖拽（Task 5 / 6 / 7）
  *
  * 边界（SPEC 第 2 节）：面板是账本，不是执行器。这里只读写 REST API，
  * 不调任何 skill，也没有任何"替我去执行"的动作。
  *
- * 留给后续任务的接口：api() state render() STATUS_LABEL STATUS_ORDER
- * buildRail() paintRail() slideRail()。
- * Task 7 接抽屉与拖拽。
+ * Task 7 接进来的：openDrawer() closeDrawer() moveCard()，以及拖拽事件。
+ * 交接约束：slideRail 必须在 reload() 之前调用（render() 会整板重建 DOM）。
  */
 
 const STATUS_ORDER = ["idea", "clarifying", "clarified", "building", "done"];
@@ -40,16 +39,28 @@ async function api(method, path, body) {
 // 过期响应丢弃：连续搜索会并发多次请求，慢的那次先回就会覆盖快的那次结果
 let loadSeq = 0;
 
+// 标签全集来自**不带筛选**的那次请求。拿当前筛选结果来算是错的：选中一个标签后
+// 选项会塌缩成只剩那一个，再也换不到别的（Task 5 的注释只防住了这一半）。
+// 但只增不减的并集同样是错的——标签被删光之后下拉里还留着死选项，选中即空板。
+// 两次都取：筛选结果喂看板，不过滤的那份喂下拉。
 async function load() {
   const seq = ++loadSeq;
   const p = new URLSearchParams();
   if (state.filter.q) p.set("q", state.filter.q);
   if (state.filter.tag) p.set("tag", state.filter.tag);
   if (state.filter.blocked) p.set("blocked", "1");
-  const items = await api("GET", "/api/ideas?" + p.toString());
+  const [items, all] = await Promise.all([
+    api("GET", "/api/ideas?" + p.toString()),
+    api("GET", "/api/ideas"),
+  ]);
   if (seq !== loadSeq) return;          // 已经有更新的请求在飞，丢掉这次
   state.items = items;
-  collectTags(items);
+  // 每次重算而不是并集：并集只增不减，标签被删后下拉留死选项，选中即空板
+  state.tags = new Set();
+  all.forEach(i => i.tags.split(",").filter(Boolean).forEach(t => state.tags.add(t)));
+  // 读成功了就把上一轮的失败横幅收掉，别让一条已经解决的错误一直挂着
+  const b = document.getElementById("board-msg");
+  if (b) b.hidden = true;
   render();
 }
 
@@ -174,6 +185,8 @@ function card(i) {
   const c = el("article", "card");
   c.dataset.id = i.id;
   c.dataset.status = i.status;
+  // Task 7：真拖拽。没有这一行 cursor:grab 是个空头支票，拖了没反应。
+  c.draggable = true;
   c.append(buildRail(i.status, i.blocked));
   const body = el("div", "card-body");
   body.append(el("div", "card-title", i.title));
@@ -188,17 +201,16 @@ function card(i) {
   }
   body.append(meta);
   c.append(body);
+  c.addEventListener("click", () => {
+    // 拖拽结束后浏览器还会补一个 click；那次不算"点卡片开抽屉"
+    if (justDragged()) return;
+    openDrawer(i.id);
+  });
   return c;
 }
 
-// 标签下拉的选项来自 state.tags 这个并集，而不是当前筛选结果。
-// 否则选中一个标签后选项会塌缩成只剩那一个，再也换不到别的标签。
-function collectTags(items) {
-  for (const i of items) {
-    i.tags.split(",").filter(Boolean).forEach(t => state.tags.add(t));
-  }
-}
-
+// 标签下拉的选项：state.tags 在 load() 里由**不带筛选**的那次请求重算。
+// 见 load() 的注释——并集只增不减会留死选项，用筛选结果算会塌缩，两个坑各踩一半。
 function renderTagFilter() {
   const sel = document.getElementById("tag");
   const cur = state.filter.tag;           // 以 state 为准，不读 sel.value
@@ -208,13 +220,380 @@ function renderTagFilter() {
   sel.value = cur;
 }
 
-/* Task 6 / Task 7 会用真正的实现覆盖下面两个函数（同文件内后声明者生效）。
-   先给最小不抛异常的版本，免得本任务交付态点一下按钮就 ReferenceError。 */
-function quickNew() { /* Task 6 填充：问标题 -> POST /api/ideas */ }
+/* ------------------------------------------------------------ 抽屉（SPEC 8.5）
+ *
+ * 点卡片 = 右侧抽屉：完整描述、标签编辑、阻塞按钮、**完整时间线**。
+ *
+ * 列表项 12 字段里**没有 events**（实测后端契约），所以抽屉必须单独取详情：
+ * 拿列表项渲染时间线只会得到一个空 ol，而那看起来像"没有历史"，
+ * 不是"接口没给"。
+ */
+
+/* 时间戳：'2026-10-12T15:18:32.123' -> '10-12 15:18'。
+ * 中间那个 T 是 ISO 格式留下的，不去掉就不是给人看的（与 CLI 同一套口径）。
+ * created_at 恒为该格式（SPEC 4.3），但仍做一次防御：万一哪天变了，
+ * 显示原值总比显示 undefined 好。 */
+function fmtTime(ts) {
+  if (typeof ts !== "string" || ts.length < 16 || ts[10] !== "T") return ts || "";
+  return ts.slice(5, 10) + " " + ts.slice(11, 16);
+}
+
+// actor / kind 的中文表。跟 panel.py 的 ACTOR/KIND 是同一套词，
+// 人和 agent 看同一条时间线时不能一个说"你"一个说"human"。
+const ACTOR_LABEL = { human: "人", agent: "agent", system: "系统" };
+const KIND_LABEL = {
+  created: "创建", status: "推进", note: "备注",
+  blocked: "标记卡住", unblocked: "解除阻塞", edited: "修改"
+};
+
+/* 抽屉内的一条提示。**抽屉关着的时候不能往里面塞消息**——那等于把错误
+ * 藏在一个用户看不见的元素里。SPEC 8.5 点名的那类 422（落回原列误发
+ * advance）恰恰发生在纯拖拽场景，此时抽屉多半是关着的：所以关着时改投
+ * 工具条下方一条横幅，用户才看得到自己拖失败了。 */
+function drawerMsg(text, kind) {
+  let m = document.getElementById("drawer-msg");
+  if (!text) {
+    if (m) m.hidden = true;
+    const b = document.getElementById("board-msg");
+    if (b) b.hidden = true;
+    return;
+  }
+  const drawerOpen = !document.getElementById("drawer").hidden;
+  if (!drawerOpen) {
+    let b = document.getElementById("board-msg");
+    if (!b) {
+      b = el("div", "board-msg");
+      b.id = "board-msg";
+      document.getElementById("board").before(b);
+    }
+    b.textContent = text;
+    b.className = "board-msg" + (kind ? " is-" + kind : "");
+    b.hidden = false;
+    return;
+  }
+  if (!m) {
+    m = el("div", "drawer-msg");
+    m.id = "drawer-msg";
+    document.getElementById("drawer-body").prepend(m);
+  }
+  m.textContent = text;
+  m.className = "drawer-msg" + (kind ? " is-" + kind : "");
+  m.hidden = false;
+}
+
+async function openDrawer(id) {
+  state.openId = id;
+  const d = document.getElementById("drawer");
+  d.hidden = false;
+  const body = document.getElementById("drawer-body");
+  body.textContent = "";
+  let idea;
+  try {
+    idea = await api("GET", "/api/ideas/" + id);
+  } catch (e) {
+    body.append(el("p", "drawer-error", "打不开：#" + id + " " + e.message));
+    return;
+  }
+  if (state.openId !== id) return;        // 期间用户已经点了别的卡
+  drawDrawer(id, idea);
+}
+
+function drawDrawer(id, idea) {
+  const body = document.getElementById("drawer-body");
+  body.textContent = "";
+
+  body.append(el("h2", "drawer-title", idea.title));
+  const sub = el("div", "drawer-sub");
+  sub.append(el("span", "drawer-id", "#" + idea.id));
+  sub.append(el("span", "drawer-status", STATUS_LABEL[idea.status] || idea.status));
+  if (idea.source) sub.append(el("span", "drawer-source", idea.source));
+  body.append(sub);
+
+  // 完整描述（body 可能是多行，纯文本保留换行）
+  body.append(el("h3", "sec-h", "描述"));
+  const bd = el("div", "drawer-body-text");
+  bd.textContent = idea.body || "（还没有描述）";
+  body.append(bd);
+
+  /* 标签编辑：整串编辑比逐个加删省事，也避免"最后剩一个标签时删不掉"这种
+   * 半吊子交互。PATCH tags 传逗号串，服务端统一规范化（SPEC 4.2）。 */
+  body.append(el("h3", "sec-h", "标签"));
+  const tagForm = el("div", "tag-form");
+  const tagInput = el("input", "tag-input");
+  tagInput.type = "text";
+  tagInput.placeholder = "逗号分隔，留空即无标签";
+  tagInput.value = idea.tags.split(",").filter(Boolean).join(",");
+  const tagSave = el("button", "secondary", "保存标签");
+  tagSave.onclick = async () => {
+    tagSave.disabled = true;
+    try {
+      const got = await api("PATCH", "/api/ideas/" + id, { tags: tagInput.value });
+      tagInput.value = got.tags.split(",").filter(Boolean).join(",");
+      drawerMsg("");
+      await load();                       // 下拉的标签全集跟着更新
+      drawDrawer(id, got);
+    } catch (e) {
+      drawerMsg(e.message, "bad");        // 例如"标签不能为空"
+    } finally {
+      tagSave.disabled = false;
+    }
+  };
+  tagForm.append(tagInput, tagSave);
+  body.append(tagForm);
+
+  /* 推进：目标状态选择器 + **可填可不填**的备注框。
+   * 备注框不是装饰——人手操作同样要能补一句，否则 human 路径写出的
+   * events 全是空 message，时间线会很难读（SPEC 8.5）。 */
+  body.append(el("h3", "sec-h", "推进"));
+  const form = el("div", "advance-form");
+  const sel = el("select", "advance-sel");
+  STATUS_ORDER.forEach(s => sel.append(new Option(STATUS_LABEL[s], s, false, s === idea.status)));
+  const note = el("input", "advance-note");
+  note.type = "text";
+  note.placeholder = "这步做了什么（可留空）";
+  const go = el("button", "primary", "推进");
+  go.onclick = async () => {
+    if (sel.value === idea.status) {      // 对齐服务端 422，但不发请求（SPEC 5.1）
+      drawerMsg("已经处于「" + STATUS_LABEL[idea.status] + "」", "warn");
+      return;
+    }
+    go.disabled = true;
+    try {
+      // 关键：body 字段名是 to，不是 status（传错不报错，只是功能坏）
+      await api("POST", "/api/ideas/" + id + "/advance",
+                { to: sel.value, note: note.value });
+      await load();
+      const got = await api("GET", "/api/ideas/" + id);
+      drawerMsg("");
+      if (state.openId === id) drawDrawer(id, got);
+    } catch (e) {
+      drawerMsg(e.message, "bad");
+    } finally {
+      go.disabled = false;
+    }
+  };
+  form.append(sel, note, go);
+  body.append(form);
+
+  /* 阻塞按钮。注意请求体字段：block 收 {reason}，不是 note（SPEC 5.6）。 */
+  body.append(el("h3", "sec-h", "阻塞"));
+  const bBtn = el("button", (idea.blocked ? "secondary" : "warn") + " block-btn",
+                  idea.blocked ? "解除阻塞" : "标记卡住");
+  bBtn.onclick = async () => {
+    bBtn.disabled = true;
+    try {
+      if (idea.blocked) {
+        await api("POST", "/api/ideas/" + id + "/unblock");
+      } else {
+        const r = window.prompt("卡在哪了？");
+        if (r === null) return;           // 用户取消，不是错误
+        if (!r.trim()) { drawerMsg("阻塞原因不能为空", "warn"); return; }
+        await api("POST", "/api/ideas/" + id + "/block", { reason: r.trim() });
+      }
+      await load();
+      const got = await api("GET", "/api/ideas/" + id);
+      drawerMsg("");
+      if (state.openId === id) drawDrawer(id, got);
+    } catch (e) {
+      drawerMsg(e.message, "bad");
+    } finally {
+      bBtn.disabled = false;
+    }
+  };
+  body.append(bBtn);
+  // 5.6：blocked_note 只是当前快照，只在真的卡住时渲染，
+  // 否则会出现"没卡住却挂着旧原因"的错觉
+  if (idea.blocked) {
+    body.append(el("p", "blocked-note", "卡住原因：" + (idea.blocked_note || "（没写）")));
+  }
+
+  body.append(el("h3", "sec-h", "时间线"));
+  const tl = el("ol", "timeline");
+  (idea.events || []).forEach(e => {
+    const li = el("li", "tl-item");
+    li.append(el("span", "ev-when", fmtTime(e.created_at)));
+    li.append(el("span", "ev-actor", ACTOR_LABEL[e.actor] || e.actor));
+    const txt = el("span", "ev-text");
+    let s;
+    if (e.kind === "status") {
+      s = (STATUS_LABEL[e.from_status] || e.from_status || "?") + " → "
+        + (STATUS_LABEL[e.to_status] || e.to_status || "?");
+      if (e.message) s += "　" + e.message;
+    } else {
+      const k = KIND_LABEL[e.kind] || e.kind;
+      s = k + (e.message ? "：" + e.message : "");
+    }
+    txt.textContent = s;
+    li.append(txt);
+    tl.append(li);
+  });
+  if (!(idea.events || []).length) tl.append(el("li", "tl-empty", "还没有记录"));
+  body.append(tl);
+}
 
 function closeDrawer() {
   document.getElementById("drawer").hidden = true;
   state.openId = null;
+}
+
+/* ------------------------------------------------------------ 拖拽（SPEC 8.5）
+ *
+ * **drop 的判定顺序是 SPEC 点名的坑**：
+ *   相同列 -> PATCH {position}；不同列 -> POST /advance {to, position}。
+ * 不要在落回原列时发 advance——那会撞上 5.1 的 422，用户看到一个莫名其妙的错误。
+ *
+ * position 在前端算中点（SPEC 4.2"由前端计算"），但**耗尽重排放服务端**：
+ * 服务端 _settle_position 是唯一收口，任何写 position 的路径都过它。
+ */
+
+/* 落点在目标列里的 position。beforeId = 落点前面那张卡（null = 落到列尾）。
+ * 从 state.items 取同列的其余卡，按 (position, id) 排序后取邻居中点——
+ * 与 store 读数口径一致，否则算出来的位置和实际排序对不上。 */
+function positionFor(toStatus, id, beforeId) {
+  const sibs = state.items
+    .filter(i => i.status === toStatus && i.id !== id)
+    .sort((a, b) => a.position - b.position || a.id - b.id);
+  const before = beforeId ? sibs.find(s => s.id === beforeId) : null;
+  if (!before) {
+    return sibs.length ? sibs[sibs.length - 1].position + 1 : 1;
+  }
+  const k = sibs.indexOf(before);
+  return k > 0 ? (sibs[k - 1].position + before.position) / 2 : before.position - 1;
+}
+
+/* 跨列拖拽：先比源列与目标列，相同走 PATCH，不同才 advance（SPEC 8.5）。
+ * 返回服务端落库后的这条卡，供调用方播流转轨。 */
+async function moveCard(id, fromStatus, toStatus, beforeId) {
+  const pos = positionFor(toStatus, id, beforeId);
+  if (fromStatus === toStatus) {
+    // 同列：只改位置。PATCH 不带 status——带了会被 422 挡掉。
+    return await api("PATCH", "/api/ideas/" + id, { position: pos });
+  }
+  // 跨列：一次 advance 同时改状态和位置，避免 advance + PATCH 两次调用产生竞态
+  return await api("POST", "/api/ideas/" + id + "/advance", { to: toStatus, position: pos });
+}
+
+let dragId = null, dragFrom = null;
+
+/* 拖拽结束后浏览器会补一个 click，那次**不算**"点卡片开抽屉"。
+ *
+ * 不用 setTimeout 清标志位：dragend 先于 click 派发，但两者不在同一个任务里，
+ * 0ms 定时器会在 click 到达之前就把标志清掉，于是每拖一次就弹一次抽屉
+ * （实测：拖完抽屉自己打开，还挡住下一次拖拽）。
+ * 改用时间窗：dragend 之后的短窗口内的 click 一律不算。 */
+let lastDragEnd = 0;
+function justDragged() {
+  return Date.now() - lastDragEnd < 500;
+}
+
+/* 拖动时的落点占位块（SPEC 8.5 的 #0000001a）。单独一个节点跟着指针走，
+ * 用户能看见"会插在哪"，而不是把卡片丢下去再猜。 */
+let phEl = null;
+function dropPlaceholder() {
+  if (!phEl) {
+    phEl = el("div", "drop-ph");
+    phEl.id = "drop-ph";
+  }
+  return phEl;
+}
+function clearPlaceholder() {
+  if (phEl && phEl.parentNode) phEl.parentNode.removeChild(phEl);
+  document.querySelectorAll(".col.drop-hint").forEach(x => x.classList.remove("drop-hint"));
+}
+
+/* 找到该插在哪张卡前面：取指针下方最近的一张的上半区/下半区判断。
+ * 返回 {list, before} —— before 为 null 表示落到列尾。 */
+function findDropSlot(col, clientY) {
+  const list = col.querySelector(".col-list");
+  const cards = [...list.querySelectorAll(".card")].filter(c => +c.dataset.id !== dragId);
+  for (const c of cards) {
+    const r = c.getBoundingClientRect();
+    if (clientY < r.top + r.height / 2) return { list, before: c };
+  }
+  return { list, before: null };
+}
+
+document.addEventListener("dragstart", e => {
+  const c = e.target.closest && e.target.closest(".card");
+  if (!c) return;
+  dragId = +c.dataset.id;
+  dragFrom = c.closest(".col").dataset.status;
+  c.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+  // Firefox 要求 setData 才肯启动拖拽；内容用不上，给个空串即可
+  e.dataTransfer.setData("text/plain", String(dragId));
+});
+
+document.addEventListener("dragend", () => {
+  const c = document.querySelector(".card.dragging");
+  if (c) c.classList.remove("dragging");
+  clearPlaceholder();
+  dragId = null; dragFrom = null;
+  // 记下收尾时刻，让紧随其后的补发 click 被 justDragged() 挡掉
+  lastDragEnd = Date.now();
+});
+
+document.addEventListener("dragover", e => {
+  const col = e.target.closest && e.target.closest(".col");
+  if (!col || dragId === null) return;
+  e.preventDefault();                       // 不 preventDefault 就不允许 drop
+  e.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".col.drop-hint").forEach(x => {
+    if (x !== col) x.classList.remove("drop-hint");
+  });
+  col.classList.add("drop-hint");
+  const { list, before } = findDropSlot(col, e.clientY);
+  const ph = dropPlaceholder();
+  if (before) list.insertBefore(ph, before); else list.appendChild(ph);
+});
+
+document.addEventListener("drop", async e => {
+  const col = e.target.closest && e.target.closest(".col");
+  if (!col || dragId === null) return;
+  e.preventDefault();
+  const id = dragId, from = dragFrom, to = col.dataset.status;
+  const ph = dropPlaceholder();
+  // beforeId 取占位块后面那张卡（占位块已经在 DOM 里，位置就是用户看到的位置）
+  const nxt = ph.nextElementSibling;
+  const beforeId = nxt && nxt.classList.contains("card") && +nxt.dataset.id !== id
+    ? +nxt.dataset.id : null;
+  clearPlaceholder();
+  const cardEl = document.querySelector('.card[data-id="' + id + '"]');
+  const rail = cardEl && cardEl.querySelector(".rail");
+  try {
+    const got = await moveCard(id, from, to, beforeId);
+    // **slideRail 必须在 reload 之前**：render() 会整板重建 DOM，重建后圆点是
+    // 新节点，没有"旧位置"可量，滑动就不会发生。
+    if (rail && got && got.status) slideRail(rail, got.status, got.blocked);
+    await load();
+  } catch (err) {
+    drawerMsg(err.message, "bad");          // 例如落回原列误发 advance 的 422
+    await load();
+  }
+  document.querySelectorAll(".card.dragging").forEach(x => x.classList.remove("dragging"));
+  dragId = null; dragFrom = null;
+  lastDragEnd = Date.now();     // 同 dragend：拖拽收尾，补发的 click 不该开抽屉
+});
+
+// 键盘可达：卡片本身是 article，拖拽对它没有意义，给一个回车开抽屉的入口
+document.addEventListener("keydown", e => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const c = e.target.closest && e.target.closest(".card");
+  if (c) { e.preventDefault(); openDrawer(+c.dataset.id); }
+});
+
+// 快捷登记
+async function quickNew() {
+  const title = window.prompt("这个创意是什么？");
+  if (title === null) return;                // 取消，不是错误
+  if (!title.trim()) return;
+  try {
+    const got = await api("POST", "/api/ideas", { title: title.trim() });
+    await load();
+    openDrawer(got.id);
+  } catch (e) {
+    drawerMsg(e.message, "bad");
+  }
 }
 
 /* 计划里说这批名字"暴露给 Task 6/7"。同一文件内互相引用靠裸名字就够了，
@@ -222,7 +601,8 @@ function closeDrawer() {
    undefined。显式挂一份，函数声明本来就在 window 上，重复挂无害。 */
 Object.assign(window, {
   api, state, render, load, reload, el, card, STATUS_ORDER, STATUS_LABEL,
-  buildRail, paintRail, slideRail
+  buildRail, paintRail, slideRail, openDrawer, closeDrawer, moveCard,
+  positionFor, quickNew, fmtTime
 });
 
 let qTimer = null;

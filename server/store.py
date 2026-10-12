@@ -17,6 +17,14 @@ class Invalid(Exception):
 
 FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
 
+# SPEC 4.2 的浮点耗尽阈值。落点与同列相邻卡片的 position 差值**严格小于**它就触发整列
+# 重排（措辞与 SPEC 一致：不是小于等于）。
+POSITION_EPSILON = 1e-10
+
+# create 路径上待插入的卡还没有 id。AUTOINCREMENT 的 id 单调且永不复用，所以拿一个
+# 比任何现有 id 都大的哨兵去比大小即可——同位置的既有卡必然排在它前面。
+_PENDING_ID = 1 << 62
+
 
 _FIELD_LABEL = {"title": "标题", "body": "描述", "source": "来源",
                 "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置"}
@@ -99,6 +107,71 @@ def _next_position(c, status):
     ).fetchone()[0]
 
 
+def _renumber(c, status, exclude_id):
+    """按 ORDER BY position, id 把该列 position 重写为 1,2,3,…（SPEC 4.2）。
+
+    exclude_id 是正在移动的那张卡：它不在这一列的最终序列里（跨列时压根还没进来，
+    列内时它带着旧 position 待改写），不排除就会被写两次 position，落点又被冲掉——
+    这正是"新插入的卡必须落在正确位置"要防的事。
+
+    两处刻意的克制：
+    - 只重写**这一列**（WHERE status=?）。连坐别的列等于把无关卡片的位置也动了。
+    - 不写 edited event：SPEC 4.4 的 kind 里没有"重排"，凭空造一条会污染时间线。
+
+    已知副作用：这一列被重排的卡 updated_at 会跳一下。trg_ideas_touch 的 WHEN 条件是
+    `NEW.updated_at = OLD.updated_at`——想压掉它就得让两者不等，而"不等"本身就意味着
+    updated_at 变了，绕不开。改 db.py 不在本任务范围内，且 SPEC 没要求重排不动时间戳。
+
+    返回 {id: 新 position}，调用方据此给移动中的卡重新落位。
+    """
+    rows = c.execute(
+        "SELECT id FROM ideas WHERE status=? AND id<>? ORDER BY position, id",
+        (status, exclude_id)).fetchall()
+    newpos = {}
+    for i, r in enumerate(rows, 1):
+        c.execute("UPDATE ideas SET position=? WHERE id=?", (i, r["id"]))
+        newpos[r["id"]] = i
+    return newpos
+
+
+def _settle_position(c, status, pos, idea_id=None):
+    """SPEC 4.2 的浮点耗尽重排，返回最终落点。
+
+    触发条件：落点与**相邻**卡片（同列排序键的前一张和后一张）的 position 差值
+    严格小于 POSITION_EPSILON。与 SPEC 措辞一致：小于，不是小于等于。
+
+    为什么放服务端而不是前端（SPEC 4.2 说"position 由前端计算，服务端只存不校验"）：
+    重排不是**校验**是**维护动作**。放服务端才绕不过去——create / PATCH / advance
+    三条写 position 的路径全部经过这一个函数；放前端等于每个写入点抄一遍，漏一处
+    就失效，而漏掉的那处恰好不会报错，只是排序悄悄变怪。
+
+    相邻取 (position, id) 两段键，和列内读数口径一致，否则 id tie-breaker 参与
+    比较的时刻与实际排序对不上。
+    """
+    exclude = -1 if idea_id is None else idea_id
+    key = _PENDING_ID if idea_id is None else idea_id
+    rows = c.execute(
+        "SELECT id, position FROM ideas WHERE status=? AND id<>?"
+        " ORDER BY position, id", (status, exclude)).fetchall()
+    if not rows:
+        return pos                                   # 空列无从耗尽
+    prev = nxt = None
+    for r in rows:
+        if (r["position"], r["id"]) < (pos, key):
+            prev = r
+        elif nxt is None:
+            nxt = r
+    gaps = [abs(pos - r["position"]) for r in (prev, nxt) if r is not None]
+    if not gaps or min(gaps) >= POSITION_EPSILON:
+        return pos                                   # 精度还有富余，不动这一列
+    newpos = _renumber(c, status, exclude)
+    if prev is not None and nxt is not None:
+        return (newpos[prev["id"]] + newpos[nxt["id"]]) / 2.0
+    if prev is not None:
+        return float(newpos[prev["id"]] + 1)
+    return float(newpos[nxt["id"]] - 1)
+
+
 def create_idea(title, body="", tags=None, source="", actor="human", position=None):
     if title is None:              # null 视同"没给标题"，走 SPEC 错误表那条文案
         raise Invalid("标题不能为空")
@@ -112,7 +185,11 @@ def create_idea(title, body="", tags=None, source="", actor="human", position=No
         position = _num(position, _FIELD_LABEL["position"])
     c = db.connect()
     try:
-        pos = _next_position(c, "idea") if position is None else position
+        # 新卡必落在 idea 列；position 缺省是 MAX+1（永不含糊），显式传入才可能
+        # 是前端算的落点。两条都过 _settle_position，差值耗尽时整列重排。
+        pos = _settle_position(c, "idea",
+                                _next_position(c, "idea") if position is None
+                                else position)
         ts = db.now_iso()
         cur = c.execute(
             "INSERT INTO ideas(title,body,status,tags,source,position,created_at,updated_at)"
@@ -192,8 +269,13 @@ def update_idea(idea_id, fields, actor="human"):
         fields = dict(fields, tags=_parse_tags(fields["tags"]))
     c = db.connect()
     try:
-        if not c.execute("SELECT 1 FROM ideas WHERE id=?", (idea_id,)).fetchone():
+        row = c.execute("SELECT status FROM ideas WHERE id=?", (idea_id,)).fetchone()
+        if not row:
             raise NotFound("没有 #%s 这条创意" % idea_id)
+        if "position" in fields:
+            # 列内移动：卡带着旧 position 在这一列里，必须把自己排除在重排之外
+            fields = dict(fields, position=_settle_position(
+                c, row["status"], fields["position"], idea_id))
         sets = ",".join("%s=?" % k for k in fields)
         c.execute("UPDATE ideas SET %s WHERE id=?" % sets,
                   list(fields.values()) + [idea_id])
@@ -220,7 +302,10 @@ def advance(idea_id, to, note=None, position=None, actor="agent"):
             raise Invalid("该创意已经处于此状态")
         ts = db.now_iso()
         done_at = ts if to == "done" else None
-        pos = _next_position(c, to) if position is None else position
+        # 跨列移动：目标列里还没有这张卡，exclude 让重排不会把它写两次
+        pos = _settle_position(c, to,
+                               _next_position(c, to) if position is None
+                               else position, idea_id)
         c.execute("UPDATE ideas SET status=?, position=?, done_at=? WHERE id=?",
                   (to, pos, done_at, idea_id))
         add_event(c, idea_id, "status", actor, note, frm, to)

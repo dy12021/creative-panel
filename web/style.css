@@ -176,12 +176,103 @@ button { cursor: pointer; }
 .boot-error-title { margin: 0 0 .35rem; }
 .boot-error-hint { margin: 0; color: var(--fg-dim); }
 
-/* ------------------------------------------------------------- 抽屉（Task 7 填充）
-
-   .drawer 的完整样式在 Task 7 追加。这里必须先把 hidden 语义钉住：
-   作者样式里的 display 会盖过浏览器默认的 [hidden]{display:none}，
-   少了这一行，抽屉在 Task 7 追加样式之前会直接盖满整个视口。 */
+/* ------------------------------------------------------------- 抽屉（Task 7）
+ *
+ * .drawer 的完整样式在 Task 7 追加。这里必须先把 hidden 语义钉住：
+ * 作者样式里的 display 会盖过浏览器默认的 [hidden]{display:none}，
+ * 少了这一行，抽屉在 Task 7 追加样式之前会直接盖满整个视口。 */
 .drawer[hidden] { display: none; }
+
+/* 8.5：右侧抽屉。fixed 贴右边，宽度够放时间线又不至于盖住整块看板
+   （SPEC 12 只保证桌面 1280px 以上，所以宽度用 vw 上限兜住）。 */
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(26rem, 40vw);
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgba(0,0,0,.35);
+  overflow-y: auto;
+  z-index: 20;
+}
+.drawer-inner { padding: 1rem 1.1rem 2rem; position: relative; }
+.drawer-close {
+  position: absolute; top: .7rem; right: .8rem;
+  background: transparent; color: var(--fg-dim);
+  border: 0; font-size: 1rem; line-height: 1; padding: .2rem .35rem;
+}
+.drawer-close:hover { color: var(--fg); }
+
+.drawer-title { font-size: 1rem; margin: 0 2rem .3rem 0; padding-right: 2rem; overflow-wrap: anywhere; }
+.drawer-sub { display: flex; gap: .5rem; align-items: baseline; color: var(--fg-dim); margin-bottom: .4rem; }
+.drawer-id { font-family: var(--mono); font-size: .75rem; }
+.drawer-status { color: var(--fg); }
+.drawer-source { font-size: .75rem; }
+.sec-h {
+  font-size: .72rem; color: var(--fg-dim); margin: 1.1rem 0 .35rem;
+  font-weight: 600; letter-spacing: .04em;
+}
+.drawer-body-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+
+.tag-form, .advance-form { display: flex; gap: .4rem; flex-wrap: wrap; }
+.tag-input, .advance-note, .advance-sel {
+  background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r); padding: .35rem .5rem;
+}
+.tag-input, .advance-note { flex: 1 1 10rem; min-width: 0; }
+.advance-note { flex: 1 1 8rem; }
+
+.advance-form .primary {
+  background: var(--st-clarified); color: var(--bg); border: 0;
+  border-radius: var(--r); padding: .35rem .8rem; font-weight: 600;
+  margin-left: 0;
+}
+.advance-form button:disabled, .tag-form button:disabled { opacity: .5; cursor: default; }
+
+/* 阻塞相关 */
+.warn { background: transparent; color: var(--blocked); border: 1px solid var(--blocked);
+  border-radius: var(--r); padding: .35rem .8rem; }
+.secondary { background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+  border-radius: var(--r); padding: .35rem .8rem; }
+.secondary:hover { color: var(--fg); }
+.blocked-note { color: var(--fg-dim); font-size: .8rem; margin: .4rem 0 0; }
+
+/* 时间线：when / actor / text 三列网格 */
+.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; }
+.tl-item {
+  display: grid; grid-template-columns: 4.6rem 2.6rem 1fr; gap: .4rem;
+  font-size: .78rem; align-items: baseline; line-height: 1.4;
+}
+.ev-when { font-family: var(--mono); color: var(--fg-dim); font-size: .72rem; }
+.ev-actor { color: var(--st-clarifying); }
+.ev-text { color: var(--fg); overflow-wrap: anywhere; }
+.tl-empty { color: var(--fg-dim); }
+
+/* 抽屉内的错误/提示。detail 恒为人话（SPEC 第 9 节），直接显示即可 */
+.drawer-msg, .board-msg {
+  border-radius: var(--r); padding: .4rem .6rem;
+  font-size: .78rem; border: 1px solid var(--border); color: var(--fg-dim);
+}
+.drawer-msg { margin: 0 0 .6rem; }
+.drawer-msg[hidden], .board-msg[hidden] { display: none; }
+/* 抽屉关着时的横幅：工具条下方一条，用户拖拽失败时看得到 */
+.board-msg { margin: .6rem .75rem 0; }
+.drawer-msg.is-bad, .board-msg.is-bad { color: var(--blocked); border-color: var(--blocked); }
+.drawer-msg.is-warn, .board-msg.is-warn { color: var(--st-building); border-color: var(--st-building); }
+.drawer-error { color: var(--blocked); }
+
+/* ------------------------------------------------------------- 拖拽（Task 7）
+ *
+ * 8.5：拖动时显示落点占位块 #0000001a（沿用 SnowLuma 的做法）。
+ * 这个色值是 8 位十六进制带 alpha 的黑色（约 10% 不透明），压在任何列底色上
+ * 都只是一层极淡的影——正合适：占位块该"在那儿"但不该抢戏。 */
+.drop-ph {
+  height: 2px; border-radius: 1px;
+  background: #0000001a;
+  outline: 1px solid #0000001a;
+  outline-offset: 1px;
+  margin: .1rem 0;
+}
+.card:focus-visible { outline: 2px solid var(--st-clarified); outline-offset: 2px; }
 
 /* 8.6：动效全局只做一处（Task 6 的流转轨滑动），其余一律不加；
    并全部服从 prefers-reduced-motion——这条规则同时保证 slideRail()
