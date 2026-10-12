@@ -29,7 +29,7 @@
 - **`position` 由前端计算，服务端只存不校验**；新建缺省 `COALESCE(MAX(position),0)+1`
 - **时间戳**：`strftime('%Y-%m-%dT%H:%M:%f','now','localtime')`，毫秒、无时区
 - **`actor`**：`X-Panel-Actor` 头，只接受 `human`/`agent`/`system`，**其他值忽略记 `human`，不报错**
-- **错误 `detail` 恒为人话字符串**：领域错误走 `Invalid`，框架层校验错误走全局 `RequestValidationError` 处理器，**两者形状必须一致**，下游 CLI 与前端都假定它是字符串
+- **错误 `detail` 恒为人话字符串**：领域错误走 `Invalid`，框架层校验错误走全局 `RequestValidationError` 处理器，**两者形状必须一致**，下游 CLI 与前端都假定它是字符串。（**例外**：未捕获异常的 500 不走本契约，`body` 是纯文本 `Internal Server Error`。）
 - **筛选参数空串归一为不过滤**：`?status=` 等空串不表达用户意图，不报 422；`?status=foobar`、`?blocked=5` 这类真值才 422
 - **所有前端资源本地化**，不引用任何 CDN
 - **提交信息用中文**，格式 `feat:` / `fix:` / `test:` / `docs:`
