@@ -63,19 +63,25 @@
 3. **丢弃空标签**
 4. 去重后重新拼接，首尾各补一个逗号
 
-`"视频, 科普, "` → `",视频,科普,"`。若规范化后为空串则存 `","`（表示"无标签"）。
+`"视频, 科普, "` → `",视频,科普,"`。
+
+**空标签的两种情况必须分开处理**：
+
+- 请求**未提供** `tags` 字段（POST / PATCH 都不带）→ 存 `","`，表示"无标签"。这是合法状态。
+- 请求**提供了** `tags` 但规范化后全空（如 `"  ,  ,"`）→ **422「标签不能为空」**。用户明确给了值却全是废的，属错误，fail fast。
+
 **标签本身禁止含逗号**——API 和 CLI 都拒绝，这是最简单且不会产生歧义的规则。
 
 **`position` 的作用域是"列内"。** 即 `(status, position)` 才是完整的排序键，不是全局唯一。跨列拖拽后 `position` 必须在目标列内重新计算，不沿用原值。所有排序一律 `ORDER BY position, id`——`id` 作为 tie-breaker 防止浮点相等时顺序抖动。
 
-新建卡片的 `position = COALESCE(该列 MAX(position), 0) + 1`。**空列没有最大值，直接写 `MAX(position) + 1` 会得到 NULL，撞上 `NOT NULL` 约束。**
+**`position` 由前端计算，服务端只存不校验。** 前端的拖拽逻辑已经知道落点夹在哪两个邻居之间，取两者 `position` 的中点即可；服务端不重复这套计算，也不对 `position` 的取值范围做检查（本机自用，值再离谱也只是排序怪，不会损坏数据）。新建卡片的 `position` 同理由前端给，缺省为 `COALESCE(该列 MAX(position), 0) + 1`。**注意空列没有最大值，直接写 `MAX(position) + 1` 会得到 NULL，撞上 `NOT NULL` 约束。**
 
 中点插入法在长期反复拖拽后会耗尽浮点精度。**重排触发条件**：当插入位置与相邻卡片的 `position` 差值小于 `1e-10` 时，按当前列的 `ORDER BY position, id` 顺序把该列 `position` 重写为 `1, 2, 3, …`。
 
-**建连时必设的 PRAGMA（两类性质不同，别混为一谈）**：
+**建连时必设的 PRAGMA（三类性质不同，别混为一谈）**：
 
 - `PRAGMA foreign_keys=ON` —— **每连接生效**，SQLite 默认关闭。不设这一句，5.7 的级联删除根本不发生。
-- `PRAGMA recursive_triggers=OFF` —— **每连接生效**，SQLite 默认关闭。4.3 的 `updated_at` 触发器在同一张表上再 `UPDATE`，靠这一条保证不自递归。
+- `PRAGMA recursive_triggers=OFF` —— **每连接生效**，SQLite 默认关闭。**这是本项目的硬性前提，不是优化项**：4.3.1 实测证明 `updated_at` 触发器在 `ON` 下会无限递归。必须设，且有测试读回断言。
 - `PRAGMA journal_mode=WAL` —— **数据库文件属性，首次建库设一次即可，之后自动持久化**。每次建连重复设置也幂等无妨，但它和上面两条不是一回事。用于避免 agent 与浏览器同时写时互相阻塞。
 
 **`PANEL_DB` 环境变量**：`db.py` 从这里读数据库路径，**缺省为 `<项目根>/data/panel.db`**。测试用它指向临时文件。与 `PANEL_URL`（CLI 读，缺省 `http://127.0.0.1:8472`）对称。
@@ -95,7 +101,8 @@ CREATE TABLE ideas (
   position     REAL NOT NULL DEFAULT 0,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
-  done_at      TEXT
+  done_at      TEXT,
+  CHECK (status IN ('idea','clarifying','clarified','building','done'))
 );
 CREATE INDEX idx_ideas_status ON ideas(status);
 
@@ -109,21 +116,50 @@ CREATE TABLE events (
   message     TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL
 );
+CREATE INDEX idx_ideas_status ON ideas(status);
+
+CREATE TABLE events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  idea_id     INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL,
+  from_status TEXT,
+  to_status   TEXT,
+  actor       TEXT NOT NULL,
+  message     TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL,
+  CHECK (kind  IN ('created','status','note','blocked','unblocked','edited')),
+  CHECK (actor IN ('human','agent','system'))
+);
 CREATE INDEX idx_events_idea ON events(idea_id, id);
 
 CREATE TRIGGER trg_ideas_touch AFTER UPDATE ON ideas
 WHEN NEW.updated_at = OLD.updated_at
 BEGIN
-  UPDATE ideas SET updated_at = strftime('%Y-%m-%dT%H:%M:%S','now','localtime')
+  UPDATE ideas SET updated_at = strftime('%Y-%m-%dT%H:%M:%f','now','localtime')
   WHERE id = NEW.id;
 END;
 ```
 
-**`updated_at` 由触发器维护，不靠每个写路径手写**，避免六个写端点漏一个就漂。
+`ideas.status` 同样加 `CHECK (status IN ('idea','clarifying','clarified','building','done'))`。CHECK 约束与 API 层校验并存：API 层给人话错误，CHECK 层兜住任何绕过 API 的写入。
 
-触发器的 `WHEN NEW.updated_at = OLD.updated_at` 是**第二道保险**：它只在本次更新没有主动改动 `updated_at` 时才写，于是内层 `UPDATE` 再次触发时 `WHEN` 为假，递归到此终止。这样即使有人把 `recursive_triggers` 打开也不会无限递归——4.2 里列该 PRAGMA 是第一道保险，这里是第二道。
+### 4.3.1 关于 updated_at 触发器的递归风险（本项目实测结论）
 
-时间戳用 `strftime('%Y-%m-%dT%H:%M:%S','now','localtime')`，产出如 `2026-10-12T14:30:00`，**不带时区偏移**。单机自用没问题；将来若做跨设备或跨时区，会需要改成带偏移的格式（见第 12 节）。
+`WHEN NEW.updated_at = OLD.updated_at` 这个条件**并不能保证不自递归**。实测矩阵：
+
+| WHEN 子句 | 时间精度 | `recursive_triggers=OFF` | `ON` + 该行恰为当前时刻 |
+|---|---|---|---|
+| 有 | 秒 | ✅ | ❌ 无限递归 |
+| 有 | **毫秒** | ✅ | ❌ **仍然无限递归** |
+| 无 | 秒 | ✅ | ❌ 无限递归（**跨秒也炸**） |
+
+两条结论：
+
+1. **毫秒精度不解决这个问题。** 递归在微秒内完成，`%f` 也会取到同一个值。实测毫秒精度与秒精度在恶劣条件下同样炸。
+2. **WHEN 子句必须保留。** 去掉它之后，连"跨秒"这种常见情况也会无限递归（内层 `UPDATE` 改的字段不同 → 无 WHEN 判断 → 再次触发）。它是在承重的，不是冗余代码。
+
+**因此：`PRAGMA recursive_triggers=OFF` 是本项目的硬性前提，不是优化项。** `db.py` 每次建连必须设置它，并有一条测试读回该 PRAGMA 断言其值为 0。WHEN 子句与毫秒精度是**纵深防御**，它们显著降低出问题的概率，但**不构成保证**——文档不宣称"即使打开也不会递归"。
+
+时间戳用 `%Y-%m-%dT%H:%M:%f`（毫秒），产出如 `2026-10-12T14:30:00.123`，**不带时区偏移**。当前单机自用没问题；将来若跨设备或跨时区，见第 12 节。
 
 级联删除依赖两件事同时成立，缺一不可：上面的 `REFERENCES ... ON DELETE CASCADE`，以及 `db.py` 每次建连时执行 `PRAGMA foreign_keys=ON`。
 
@@ -141,7 +177,7 @@ END;
 | `blocked` / `unblocked` | block / unblock |
 | `edited` | PATCH（见 5.5） |
 
-时间戳统一用 ISO 8601 本地时间字符串。
+时间戳由服务端统一生成，用 `strftime('%Y-%m-%dT%H:%M:%f','now','localtime')`，**毫秒精度、不带时区偏移**（将来若要跨时区，见第 12 节）。
 
 ## 5. REST API
 
@@ -161,7 +197,9 @@ DELETE /api/ideas/{id}
 GET    /api/stats                         各态计数 + 阻塞数
 ```
 
-`version` 取自 `server/app.py` 顶部的 `VERSION` 常量，硬编码，随功能变更手动递增。
+`version` 取自 `server/app.py` 顶部的 `VERSION` 常量，硬编码，随功能变更手动递增。本机自用这样最简单；若将来版本号开始漂移，可改为从 `.version` 文件读取或构建时注入。
+
+`created_at` / `events.created_at` 由服务端统一生成，格式与 4.3 相同（毫秒精度、不带时区，见第 12 节）。
 
 **`PATCH` 字段白名单**：仅接受 `title`、`body`、`tags`、`source`、`blocked_note`、`position`。请求体中出现任何其他键（含 `status`、`blocked`、`id`）一律返回 422。
 
@@ -194,7 +232,7 @@ GET    /api/stats                         各态计数 + 阻塞数
 
 - `status`：精确等于该状态 key；非法值 422
 - `tag`：与**整标签**精确相等，不是子串匹配。配合 4.2 的首尾逗号约定，实现为 `tags LIKE '%,'||?||',%'`
-- `q`：对 `title` 和 `body` 分别做子串匹配，大小写不敏感。空格分隔的多个关键词是 **AND** 关系，且**每个词独立地匹配 title 或 body**（不是把整串当一个子串找）
+- `q`：对 `title` 和 `body` 分别做子串匹配。空格分隔的多个关键词是 **AND** 关系，且**每个词独立地匹配 title 或 body**（不是把整串当一个子串找）。实现直接用 SQLite `LIKE`——它**默认对 ASCII 大小写不敏感**，英文 `AI`/`ai` 天然满足，中文无大小写也满足。**不要额外套 `lower()` 或 `COLLATE NOCASE`**；只有将来要支持俄语、希腊语等有大小写的非 ASCII 语言时才需要改。
 - `blocked`：`1` 只返回卡住的，`0` 只返回没卡住的，省略返回全部
 
 ### 5.4 actor 的判定
@@ -203,6 +241,8 @@ GET    /api/stats                         各态计数 + 阻塞数
 
 - `panel.py` CLI 固定带 `X-Panel-Actor: agent`
 - 前端约定**不带**该头，服务端缺省记为 `human`
+
+**头里的非法值一律忽略，按缺省 `human` 处理，不返回 422。** 只接受 `human` / `agent` / `system` 三个值，其余（如 `robot`）当没传。本机无鉴权，为一个取值报错没有意义，忽略更稳。
 
 这是一个**约定而非安全边界**：浏览器 fetch 同样能设置自定义头。本机无鉴权、仅自己使用，这个弱约束够用，唯一的价值是让时间线里的 actor 大致可信。**不要把它当成防伪机制写进代码注释。**
 
@@ -214,6 +254,7 @@ GET    /api/stats                         各态计数 + 阻塞数
 
 - `PATCH {}`（空对象）→ **422**「没有可更新的字段」，与"白名单外字段"同样 fail fast。
 - 字段值与当前值**完全相同** → **仍然 200 且仍写一条 `edited` event**。语义是"有人碰过这条记录"，且实现上无需额外做差异比较。
+- 任一字段传 **`null`** → **422**「字段不能为 null」。要清空字段就传空串 `""`。`null` 语义歧义，且会撞 `NOT NULL` 约束。
 
 ### 5.6 block / unblock 的行为
 
@@ -337,7 +378,7 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
    └┊┘  done        未到   虚线
 ```
 
-已过的格子用**它自己那一态的颜色**，而不是当前态的颜色——这样整条轨本身就是一条状态光谱。
+已过的格子用**它自己那一态的颜色**，而不是当前态的颜色——这样整条轨本身就是一条状态光谱。注意第一格（`idea`）是中性灰，与次要文字同色，在灰色卡片上对比度可能不足，**实心格需保证对比度，必要时提亮或加 1px 描边**。
 
 **跳跃推进时，被跳过的态算"已过"，一律实心。** 例如 `idea` 直接跳到 `building`，上图中前 3 格全实心、第 4 格发光、第 5 格虚线。这符合线性有序语义。实现时按**索引比较**画，不要按"走过的路径"画。
 
@@ -395,8 +436,10 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 | `status` 筛选值非法 | 422；「未知状态：foobar」 |
 | PATCH 含白名单外的字段 | 422；指出是哪个字段，并提示状态须走 advance |
 | PATCH 空对象 | 422；「没有可更新的字段」 |
+| PATCH 字段传 `null` | 422；「字段不能为 null，请传空串」 |
 | 标签含逗号 | 422；「标签不能包含逗号」 |
-| 标签规范化后为空 | 422；「标签不能为空」 |
+| 提供了 tags 但规范化后全空 | 422；「标签不能为空」 |
+| `X-Panel-Actor` 值非法 | **不报错**，按缺省 `human` 记录（见 5.4） |
 | id 不存在 | 404；CLI 打印「没有 #99 这条创意」 |
 
 CLI 捕获 HTTP 错误后把后端的 `detail` 字段原样翻译成人话，不打印堆栈。
@@ -426,6 +469,8 @@ creative-panel/
 
 skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负责同步到 `%USERPROFILE%\.minimax\skills\creative-panel\`，避免两份漂移。
 
+**同步方向是单向的：以项目内的 `skill/` 为准，覆盖 `%USERPROFILE%\.minimax\skills\creative-panel\`。不要反过来直接改安装目录里的副本**——那份是安装产物，下次同步会被覆盖，改了等于没改（且改动丢失）。
+
 **注意：Windows 的 bat 不展开 `~`**，脚本里必须写 `%USERPROFILE%` 而不是 `~/.minimax`。
 
 `.gitignore` 忽略 `data/`。
@@ -450,7 +495,12 @@ skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负
 10. tags 规范化：`"视频, 科普, "` → `",视频,科普,"`；`tag=科普` 命中、`tag=科` 不命中；全空白标签被拒
 11. 排序稳定性：`position` 相同时按 `id` 升序
 12. 空列中新建卡片 `position` 为 1（验 `COALESCE`，不撞 NOT NULL）
-13. 任意一条 UPDATE 都刷新 `updated_at`，且触发器不自递归
+13. 任意一条 UPDATE 都刷新 `updated_at`
+14. **建连后读回 `PRAGMA recursive_triggers` 断言为 0、`PRAGMA foreign_keys` 断言为 1**（4.3.1 的硬性前提，必须有回归锁）
+15. CHECK 约束生效：绕过 API 直接写非法 `status` / `actor` / `kind` 被数据库拒绝
+16. `PATCH {"body": null}` 返回 422
+17. `X-Panel-Actor: robot` 不报错，`actor` 记为 `human`
+18. 未提供 `tags` 存 `","`；提供 `"  ,  ,"` 返回 422
 
 目标：改后端后一条命令能确认没回归。
 
