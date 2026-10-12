@@ -50,7 +50,27 @@
 
 状态是**线性有序**的：`idea < clarifying < clarified < building < done`。
 
-### 4.2 ideas 表
+### 4.2 存储约定
+
+以下几条是容易踩坑的地方，实现时必须照做：
+
+**`tags` 首尾补逗号。** 存 `",视频,科普,"` 而不是 `"视频,科普"`，这样精确匹配只需一条 `LIKE '%,'||?||',%'`，不用写四路 `OR`。**标签本身禁止含逗号**——CLI 和 API 都拒绝含逗号的标签，这是最简单且不会产生歧义的规则。
+
+**`position` 的作用域是"列内"。** 即 `(status, position)` 才是完整的排序键，不是全局唯一。跨列拖拽后 `position` 必须在目标列内重新计算，不沿用原值。所有排序一律 `ORDER BY position, id`——`id` 作为 tie-breaker 防止浮点相等时顺序抖动。中点插入法在长期反复拖拽后会耗尽浮点精度，届时执行一次全量重排（按当前列顺序重写 `position` 为 1,2,3…）。
+
+**`updated_at` 由 SQLite 触发器维护**，不靠每个写路径手写，避免漏改：
+
+```sql
+CREATE TRIGGER trg_ideas_touch AFTER UPDATE ON ideas
+BEGIN
+  UPDATE ideas SET updated_at = strftime('%Y-%m-%dT%H:%M:%S','now','localtime')
+  WHERE id = NEW.id;
+END;
+```
+
+**`PRAGMA journal_mode=WAL`** 在每次建连时设置。agent 和浏览器可能同时写，WAL 避免互相阻塞。
+
+### 4.3 表结构
 
 ```sql
 CREATE TABLE ideas (
@@ -60,24 +80,18 @@ CREATE TABLE ideas (
   status       TEXT NOT NULL DEFAULT 'idea',
   blocked      INTEGER NOT NULL DEFAULT 0,
   blocked_note TEXT NOT NULL DEFAULT '',
-  tags         TEXT NOT NULL DEFAULT '',   -- 逗号分隔
+  tags         TEXT NOT NULL DEFAULT '',   -- 约定：首尾补逗号
   source       TEXT NOT NULL DEFAULT '',
-  position     REAL NOT NULL DEFAULT 0,     -- 列内手动排序
+  position     REAL NOT NULL DEFAULT 0,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
   done_at      TEXT
 );
 CREATE INDEX idx_ideas_status ON ideas(status);
-```
 
-### 4.3 events 表
-
-审计流。人（前端拖拽）和 agent（CLI）的每次改动都留痕。
-
-```sql
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  idea_id     INTEGER NOT NULL,
+  idea_id     INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
   kind        TEXT NOT NULL,   -- created|status|note|blocked|unblocked|edited
   from_status TEXT,
   to_status   TEXT,
@@ -87,6 +101,22 @@ CREATE TABLE events (
 );
 CREATE INDEX idx_events_idea ON events(idea_id, id);
 ```
+
+级联删除依赖两件事同时成立，缺一不可：上面的 `REFERENCES ... ON DELETE CASCADE`，以及 `db.py` 每次建连时执行 `PRAGMA foreign_keys=ON`（SQLite 默认关闭外键，不开这一句级联不会发生）。
+
+`source` 的语义：**这条创意是从哪儿来的**，例如 `对话产生` / `随手记` / `从 AI 发展史项目带过来`。它是自由文本，不做枚举约束。
+
+### 4.4 events 表
+
+审计流。人（前端拖拽）和 agent（CLI）的每次改动都留痕。`kind` 取值：
+
+| kind | 何时写 |
+|---|---|
+| `created` | POST /api/ideas |
+| `status` | advance |
+| `note` | POST .../note |
+| `blocked` / `unblocked` | block / unblock |
+| `edited` | PATCH（见 5.5） |
 
 时间戳统一用 ISO 8601 本地时间字符串。
 
@@ -99,8 +129,8 @@ GET    /api/health                        {ok, version}
 GET    /api/ideas?status=&tag=&q=&blocked= 列表
 POST   /api/ideas                         建创意
 GET    /api/ideas/{id}                    单条 + events
-PATCH  /api/ideas/{id}                    改字段（不含 status）
-POST   /api/ideas/{id}/advance            {to, note?} 改状态
+PATCH  /api/ideas/{id}                    见下方白名单
+POST   /api/ideas/{id}/advance            {to, note?, position?}
 POST   /api/ideas/{id}/note               {message} 追加备注
 POST   /api/ideas/{id}/block              {reason}
 POST   /api/ideas/{id}/unblock
@@ -108,44 +138,64 @@ DELETE /api/ideas/{id}
 GET    /api/stats                         各态计数 + 阻塞数
 ```
 
+`version` 取自 `server/app.py` 顶部的 `VERSION` 常量，硬编码，随功能变更手动递增。
+
+**`PATCH` 字段白名单**：仅接受 `title`、`body`、`tags`、`source`、`blocked_note`、`position`。请求体中出现任何其他键（含 `status`、`blocked`、`id`）一律返回 422。
+
 ### 5.1 关键约束：状态只能走 advance
 
 **`PATCH` 请求体中出现 `status` 字段必须返回 422**，错误信息为"请使用 /advance 接口变更状态"。
 
 理由：`advance` 是唯一会写 `events` 的状态变更路径。禁止 PATCH 改 status，保证任何状态变化都必然产生一条审计记录，不会出现卡片莫名跳格而时间线里查不到原因。
 
-同理 `block` / `unblock` 也走各自的端点，不通过 PATCH 的 `blocked` 字段——但 PATCH 允许改 `blocked_note`（仅在已阻塞时有意义）。
+同理 `block` / `unblock` 也走各自的端点，不通过 PATCH 的 `blocked` 字段——但 PATCH 允许改 `blocked_note`。
+
+**advance 到当前状态返回 422**，错误信息"该创意已经处于此状态"。理由与禁 PATCH status 一致：`events` 只记录真实变更，不写 `from == to` 的噪声记录。代价是前端在渲染"推进"按钮时要自己判断目标态，不能无条件发请求。
 
 **状态跳跃是允许的**：可以从 `idea` 直接 advance 到 `building`。允许回退。约束只在于"必须留下记录"，不限制跳几步。
 
 **advance 到 `done` 时自动写 `done_at`**；离开 `done` 时清空 `done_at`。
 
-### 5.2 排序
+### 5.2 position 与拖拽
 
-列内排序用 `position`。前端拖拽时提交目标位置的 `position` 值（卡片间中点）。新建卡片 `position = 该列最大值 + 1`。
+`advance` 接受可选 `position`，用于**跨列拖拽时一次调用同时改状态和位置**，避免"advance + PATCH"两次调用产生竞态。
+
+- **跨列拖拽** → `POST /advance {to, position}`
+- **列内拖拽** → `PATCH {position}`
+
+新建卡片 `position = 该列当前最大值 + 1`。
 
 ### 5.3 筛选语义
 
-四个筛选参数正交，同时出现时取交集。
+四个筛选参数正交，同时出现时取交集。**任一筛选参数非法一律返回 422**，不做静默降级——fail fast 与 advance 的非法状态名处理保持一致。
 
-- `status`：精确等于该状态 key
-- `tag`：与**整标签**精确相等，不是子串匹配。`tags` 存为 `"视频,科普"`，`tag=科普` 命中；`tag=科` 不命中
-- `q`：对 `title` 和 `body` 做**子串匹配，大小写不敏感**。多个关键词以空格分隔时取 AND
+- `status`：精确等于该状态 key；非法值 422
+- `tag`：与**整标签**精确相等，不是子串匹配。配合 4.2 的首尾逗号约定，实现为 `tags LIKE '%,'||?||',%'`
+- `q`：对 `title` 和 `body` 分别做子串匹配，大小写不敏感。空格分隔的多个关键词是 **AND** 关系，且**每个词独立地匹配 title 或 body**（不是把整串当一个子串找）
 - `blocked`：`1` 只返回卡住的，`0` 只返回没卡住的，省略返回全部
 
 ### 5.4 actor 的判定
 
-`events.actor` **由调用通道决定，不接受客户端传入**：
+`events.actor` 由请求头决定，请求体不接受该字段。
 
-- 前端（浏览器 fetch）发起的写操作 → `human`
-- `panel.py` CLI 发起的写操作 → `agent`
-- 未来若有服务端自身触发的变更（如启动时清理）→ `system`
+- `panel.py` CLI 固定带 `X-Panel-Actor: agent`
+- 前端约定**不带**该头，服务端缺省记为 `human`
 
-实现方式：CLI 在 HTTP 头带 `X-Panel-Actor: agent`，服务端读取该头；缺失时默认 `human`。客户端**不能**通过请求体指定 actor。这样审计记录中的 actor 永远可信。
+这是一个**约定而非安全边界**：浏览器 fetch 同样能设置自定义头。本机无鉴权、仅自己使用，这个弱约束够用，唯一的价值是让时间线里的 actor 大致可信。**不要把它当成防伪机制写进代码注释。**
 
-### 5.5 删除
+### 5.5 PATCH 的 event 写法
 
-`DELETE /api/ideas/{id}` 级联删除其 `events`，不留孤儿。
+一次 PATCH 无论改几个字段，**只写一条 `edited` event**，`message` 记录被修改的字段名列表（如 `修改了：tags, source`），不存 diff——diff 在这里没有阅读价值，知道"哪些字段被碰过"就够了。
+
+### 5.6 unblock 的行为
+
+`unblock` **保留** `blocked_note` 不清空。历史原因以 `events` 为准，卡片上的 `blocked_note` 只是当前快照。**前端只在 `blocked == 1` 时渲染 `blocked_note`**，避免出现"没卡住却挂着旧原因"的错觉。
+
+再次 `block` 会覆盖 `blocked_note`。
+
+### 5.7 删除
+
+`DELETE /api/ideas/{id}` 通过外键级联删除其 `events`，不留孤儿。依赖 4.3 的 `ON DELETE CASCADE` 与 `PRAGMA foreign_keys=ON`。
 
 ## 6. panel.py CLI
 
@@ -171,9 +221,11 @@ python panel.py delete <id>
     需求已明确：6段H3，每段90秒
 ```
 
-`advance` 的第二个参数接受英文 key 或中文显示名，两者都合法。
+`advance` 的第二个参数接受英文 key 或中文显示名，两者都合法。推进到当前状态会被服务端拒绝（422），CLI 需把该错误翻译成「#12 已经在『正在明确』了」。
 
-服务地址从 `panel.py` 顶部的 `BASE_URL` 常量读，默认 `http://127.0.0.1:8472`。
+CLI 每次请求固定带 `X-Panel-Actor: agent` 头。`tags` 的首尾逗号由服务端统一处理，CLI 只需原样传入 `视频,科普`。
+
+服务地址从 `panel.py` 顶部的 `BASE_URL` 常量读，默认 `http://127.0.0.1:8472`；可用环境变量 `PANEL_URL` 覆盖（测试用）。
 
 ## 7. creative-panel skill
 
@@ -228,22 +280,32 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 |---|---|---|
 | `idea` 仅有创意 | 中性灰 `oklch(66% .02 240)` | 没方向就该是灰的 |
 | `clarifying` 正在明确 | sky `oklch(75% .14 230)` | 在探索，冷 |
-| `clarified` 已经明确 | violet `oklch(70% .183 293.541)` | 成形了，接品牌紫 |
+| `clarified` 已经明确 | violet `oklch(70% .18 293)` | 成形了，接品牌紫 |
 | `building` 正在制作 | amber `oklch(80% .16 80)` | 在干活，是热的 |
 | `done` 完成成品 | emerald `oklch(72% .15 160)` | 绿，收尾 |
-| 阻塞 | red `oklch(62% .2 27)` | 覆盖整行 |
+| 阻塞 | red `oklch(62% .2 27)` | 仅作用于当前态圆点与卡片描边 |
 
 色序语义：灰 → 冷 → 冷紫 → 暖 → 绿，色温从冷走到暖再收。amber 用于"制作中"是热度而非警告；红色全部留给阻塞。
 
+色值统一取两位小数（原始取自 SnowLuma 的 violet 是 `293.541`，此处已归一化）。
+
 ### 8.3 签名元素：流转轨
 
-每张卡片左缘一条竖直轨，分 5 段对应 5 态：已过的实心、当前态高亮发亮、未到的虚线。卡片阻塞时整轨转红。
+每张卡片左缘一条竖直轨，分 5 段对应 5 态。段填充规则——**以当前态索引 `i`（`idea`=0 … `done`=4）为准**：
+
+- 索引 `< i` → 实心（已过）
+- 索引 `== i` → 发光圆点（当前）
+- 索引 `> i` → 虚线（未到）
+
+**跳跃推进时，被跳过的态算"已过"，一律实心。** 例如 `idea` 直接跳到 `building`（`i=3`），前 3 段全实心，第 4 段发光，第 5 段虚线。这符合线性有序语义，实现时不要按"走过的路径"画，要按索引比较画。
 
 ```
 ▌ AI 发展史短片系列
-▌ ┃━━━━━━◉┄┄┄┄┄     ← 制作中：前两态实心，第三态发光，后两态虚线
+▌ ┃━━━━━━━◉┄┄┄       ← building：3 段实心，第 4 段发光，第 5 段虚线
 ▌ 视频 · 科普
 ```
+
+**阻塞时不要把整条轨涂红。** 整轨变红会丢掉"走到哪一步"这个信息，正是流转轨存在的意义。正确做法：只把**当前态圆点**转为红色，并给卡片加一道红色描边。进度可读性必须保留。
 
 作用：不点开卡片就能看出它走到哪一步。这是本产品区别于通用任务板的核心识别特征。
 
@@ -265,9 +327,10 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 
 ### 8.5 交互
 
-- 跨列拖拽 = advance，立刻写 `events`（actor=human），卡片回填新位置
-- 列内拖拽 = 改 `position`
-- 点卡片 = 右侧抽屉：完整描述、标签编辑、推进按钮、阻塞按钮、完整时间线
+- **跨列拖拽** = 一次 `POST /advance {to, position}`，立刻写 `events`（actor=human）
+- **列内拖拽** = `PATCH {position}`
+- 点卡片 = 右侧抽屉：完整描述、标签编辑、阻塞按钮、**完整时间线**
+- 抽屉里的"推进"控件 = 目标状态选择器 + **一个可填可不填的备注框**。人手操作同样要能补一句，否则 human 路径写出的 events 全是空 message，时间线会很难读
 - 拖动时显示落点占位块 `#0000001a`（沿用 SnowLuma 的做法）
 
 ### 8.6 动效
@@ -292,7 +355,10 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 | 服务未启动 | CLI 打印「面板未启动，请双击 start.bat」，退出码 1 |
 | 标题为空 | 422；CLI 打印「标题不能为空」 |
 | 非法状态名 | 422；CLI 列出 5 个合法状态名 |
-| PATCH 传 status | 422；「请使用 /advance 接口变更状态」 |
+| advance 到当前状态 | 422；「该创意已经处于此状态」 |
+| `status` 筛选值非法 | 422；「未知状态：foobar」 |
+| PATCH 含白名单外的字段 | 422；指出是哪个字段，并提示状态须走 advance |
+| 标签含逗号 | 422；「标签不能包含逗号」 |
 | id 不存在 | 404；CLI 打印「没有 #99 这条创意」 |
 
 CLI 捕获 HTTP 错误后把后端的 `detail` 字段原样翻译成人话，不打印堆栈。
@@ -302,10 +368,10 @@ CLI 捕获 HTTP 错误后把后端的 `detail` 字段原样翻译成人话，不
 ```
 creative-panel/
   start.bat                 双击启动
-  install_skill.bat         把 skill 装进 ~/.minimax/skills/
+  install_skill.bat         同步 skill 到 %USERPROFILE%\.minimax\skills\
   server/
-    app.py                  FastAPI 路由
-    db.py                   schema + 连接
+    app.py                  FastAPI 路由 + VERSION 常量
+    db.py                   schema + 建连（含两个 PRAGMA）+ 触发器
   web/
     index.html
     app.js
@@ -320,23 +386,31 @@ creative-panel/
   docs/superpowers/specs/
 ```
 
-skill 源码放在项目里与代码一起版本控制，`install_skill.bat` 负责同步到 `~/.minimax/skills/creative-panel/`，避免两份漂移。
+skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负责同步到 `%USERPROFILE%\.minimax\skills\creative-panel\`，避免两份漂移。
+
+**注意：Windows 的 bat 不展开 `~`**，脚本里必须写 `%USERPROFILE%` 而不是 `~/.minimax`。
 
 `.gitignore` 忽略 `data/`。
 
 ## 11. 测试策略
 
-`test_panel.py`，跑真实 HTTP 服务，依赖仅 `httpx`。
+`test_panel.py`，依赖 `pytest` + `httpx`。
+
+**运行方式**：用 `tmp_path` fixture 建临时 db 文件，通过 `PANEL_DB` 环境变量让 `db.py` 指向它；在同一 fixture 里用 `uvicorn.Server` 起一个后台线程监听**随机空闲端口**，测试全部通过真实 HTTP 访问。fixture 结束时关线程、删临时文件。**绝不使用 `data/panel.db`**，也不占用固定端口 8472，因此可与正在运行的面板并存、可重复运行。
 
 覆盖：
 
 1. 建创意 → 5 态全链路推进 → `events` 条数与顺序正确
 2. `PATCH` 传 `status` 返回 422
-3. 阻塞 / 解除阻塞各写一条 event
-4. 四维筛选：`status` / `tag` / `q` / `blocked`
-5. 删除级联删除 `events`
-6. advance 到 `done` 写 `done_at`，离开 `done` 清空
-7. 幂等：可重复运行不报错
+3. `PATCH` 传白名单外字段返回 422
+4. advance 到当前状态返回 422
+5. 阻塞 / 解除阻塞各写一条 event，且 `unblock` 后 `blocked_note` 保留
+6. 四维筛选：`status` / `tag` / `q` / `blocked`，含非法 `status` 返回 422
+7. 删除级联删除 `events`（这条专门验证 `PRAGMA foreign_keys=ON` 真的生效）
+8. advance 到 `done` 写 `done_at`，离开 `done` 清空
+9. `PATCH` 多字段只写一条 `edited` event
+10. tags 首尾逗号约定：`tag=科普` 命中、`tag=科` 不命中
+11. 排序稳定性：`position` 相同时按 `id` 升序
 
 目标：改后端后一条命令能确认没回归。
 
@@ -352,6 +426,12 @@ skill 源码放在项目里与代码一起版本控制，`install_skill.bat` 负
 - 服务端推送（前端轮询即可）
 - 移动端适配（先保证桌面 1280px 以上可用）
 - skill 自动调用（面板不会主动去跑别的 skill）
+
+**将来很可能会回头做的**（现在明确不做，但记在这里免得重新讨论）：
+
+- `GET /api/events?since=` 全局事件流。若以后想做"最近发生了什么"这类跨创意的视图，现在只能逐个 idea 取 events 拼装
+- 卡片附件缩略图（要动存储模型，是另一个 spec 的事）
+- 多设备同步（当前假设只有这一台机器）
 
 ## 13. 技术选型理由
 
