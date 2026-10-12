@@ -51,6 +51,7 @@ def label(key):
     """未知 key 也照样显示，不因为多了一个状态就 KeyError。
 
     显示层不该崩——真出问题了也得先让人看到已经发生的事。
+    这里只兜"键不认识"；键的类型由调用点的 _obj(types=...) 收口，不在这里查。
     """
     return LABEL.get(key, key)
 
@@ -67,17 +68,32 @@ def _to_key(text):
     return text
 
 
-def _obj(value, where, *keys):
-    """确认一段响应是该有的形状，原样返回；形状不对就 Fail。
+# 值的类型也要查：进 `%d` 的要是整数，进 `.strip()`/`.replace()` 的要是文本。
+# tags/body/blocked_note 额外容许 null——"没填"在显示层就是空，不是错
+# （本面板的列是 NOT NULL，正常走不到 null；容许它是为了让外来响应也不炸）。
+_NULL_IS_EMPTY = (str, type(None))
+
+
+def _obj(value, where, *keys, types=None):
+    """确认一段响应的**键在、值的类型也对**，原样返回；不对就 Fail。
 
     SPEC 第 9 节禁的是「Python 栈甩给 agent」，那不只发生在**错误**响应上：
     PANEL_URL 指到别的服务、服务端比 CLI 新一版，200 里都可能是个数组或者少
     了字段。那时 `d["counts"]` 这种直接下标抛的是 TypeError/KeyError，
     和 JSONDecodeError 一样是满屏栈。成功路径也得说一句人话。
+
+    键在≠形状对：`id` 是个字符串时 `"#%d" % d["id"]` 照样抛 TypeError，
+    `tags` 是个数字时 `.strip()` 抛 AttributeError。所以类型也得查——哪些
+    位置敏感（进 `%d`、进 `.strip()`/`.replace()`、当 `label()` 的键）就
+    在 `types` 里登记，不散落 `isinstance`。
     """
     if not isinstance(value, dict) or any(k not in value for k in keys):
         raise Fail("面板返回的%s不是预期格式（需要：%s），请确认 PANEL_URL 指向面板"
                    % (where, "、".join(keys)))
+    for k, typ in (types or {}).items():
+        if not isinstance(value[k], typ):
+            raise Fail("面板返回的%s里「%s」类型不对（收到 %s），请确认 PANEL_URL 指向面板"
+                       % (where, k, type(value[k]).__name__))
     return value
 
 
@@ -216,11 +232,13 @@ def _advance(a):
         # 服务端只说「该创意已经处于此状态」，没说是哪个状态——对调用方没用。
         # 补读一次把状态名翻成人话（SPEC 6 点名的翻译）。
         if e.status == 422 and "已经处于此状态" in str(e):
-            cur = _obj(call("GET", "/api/ideas/%s" % a.id), "创意详情", "status")
+            cur = _obj(call("GET", "/api/ideas/%s" % a.id), "创意详情", "status",
+                       types={"status": str})
             raise Fail("#%s 已经在『%s』了" % (a.id, label(cur["status"])))
         raise
     print("✔ #%s 已推进，当前状态：%s"
-          % (a.id, label(_obj(d, "推进结果", "status")["status"])))
+          % (a.id, label(_obj(d, "推进结果", "status",
+                              types={"status": str})["status"])))
     if a.note:
         print("    %s" % a.note)
 
@@ -231,32 +249,38 @@ def _timeline(events):
     for raw in events:
         e = _obj(raw, "时间线里的一条",
                  "actor", "kind", "created_at", "message",
-                 "from_status", "to_status")
+                 "from_status", "to_status",
+                 types={"actor": str, "kind": str, "created_at": str,
+                        "message": _NULL_IS_EMPTY,
+                        "from_status": _NULL_IS_EMPTY,
+                        "to_status": _NULL_IS_EMPTY})
         who = ACTOR.get(e["actor"], e["actor"])
         ts = e["created_at"]
-        if not isinstance(ts, str):
-            raise Fail("面板返回的事件时间不是文本（%r），请确认 PANEL_URL 指向面板"
-                       % (ts,))
         # "2026-10-12T15:18:32.123" -> "10-12 15:18"：中间那个 T 是 ISO
         # 格式留下的，不去掉就不是给人看的。
         when = "%s %s" % (ts[5:10], ts[11:16])
+        msg = e["message"] or ""
         if e["kind"] == "status":
             print("  %s [%s] %s → %s %s" % (when, who, label(e["from_status"]),
-                                             label(e["to_status"]), e["message"]))
+                                             label(e["to_status"]), msg))
         else:
             print("  %s [%s] %s %s" % (when, who, KIND.get(e["kind"], e["kind"]),
-                                       e["message"]))
+                                       msg))
 
 
 def _show(a):
     d = _obj(call("GET", "/api/ideas/%s" % a.id), "创意详情",
              "id", "title", "status", "blocked", "blocked_note",
-             "tags", "body", "events")
+             "tags", "body", "events",
+             types={"id": int, "title": str, "status": str, "blocked": int,
+                    "blocked_note": _NULL_IS_EMPTY, "tags": _NULL_IS_EMPTY,
+                    "body": _NULL_IS_EMPTY, "events": list})
     print("#%d「%s」  状态=%s%s" % (d["id"], d["title"], label(d["status"]),
-                                    "  已阻塞：%s" % d["blocked_note"]
+                                    "  已阻塞：%s" % (d["blocked_note"] or "")
                                     if d["blocked"] else ""))
-    if d["tags"] != ",":
-        print("  标签：%s" % "、".join(t for t in d["tags"].strip(",").split(",")))
+    tags = [t for t in (d["tags"] or "").strip(",").split(",") if t]
+    if tags:
+        print("  标签：%s" % "、".join(tags))
     if d["body"]:
         print("  描述：%s" % d["body"].replace("\n", "\n        "))
     print("  ── 时间线 ──")
@@ -273,7 +297,8 @@ def _list(a):
         print("（没有符合条件的创意）")
         return
     for raw in items:
-        d = _obj(raw, "列表里的一条", "id", "status", "title", "blocked")
+        d = _obj(raw, "列表里的一条", "id", "status", "title", "blocked",
+                 types={"id": int, "status": str, "title": str, "blocked": int})
         print("#%-4d %s [%s] %s" % (d["id"], "■" if d["blocked"] else " ",
                                     label(d["status"]), d["title"]))
 
@@ -298,7 +323,8 @@ def dispatch(a):
         d = _obj(call("POST", "/api/ideas",
                       json={"title": a.title, "body": a.body,
                             "tags": a.tags, "source": a.source}),
-                 "新建结果", "id", "title", "status")
+                 "新建结果", "id", "title", "status",
+                 types={"id": int, "title": str, "status": str})
         print("✔ 已创建 #%d「%s」  状态=%s" % (d["id"], d["title"],
                                               label(d["status"])))
     elif c == "list":

@@ -1,6 +1,7 @@
 """创意面板后端回归测试。设计依据 SPEC 第 11 节。"""
 import ast
 import importlib
+import json
 import os
 import re
 import socket
@@ -1214,26 +1215,51 @@ def live_server(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def stub_server():
-    """假服务端：按给定的 (status, content-type, body) 应答任意 GET。
+    """假服务端：按给定的 (status, content-type, body) 应答任意 GET/POST。
 
     存在的理由是**活的服务端造不出这些响应**：未捕获异常的 500 是纯文本而不是
-    {"detail": ...}（不在 detail 契约内），框架层处理器也管不到它。
+    {"detail": ...}（不在 detail 契约内），框架层处理器也管不到它；字段类型
+    对不上的 200 同理，本面板的列都是 NOT NULL。
     """
     started = []
 
-    def _start(status, ctype, body):
+    def _start(*responses):
+        """应答依次消费 (status, ctype, body)，用完停在最后一条。
+
+        单条时可以按旧的 `stub_server(200, ctype, body)` 传，也可以直接传一个
+        元组序列；给多条是为了验"同一个子命令连打两次"的路径（advance 推到
+        当前状态时会先 POST 吃 422、再 GET 补读状态）。
+        """
+        if responses and not isinstance(responses[0], tuple):
+            responses = [responses]         # 旧的三元组调用
+        seq = list(responses) or [(200, "application/json", b"{}")]
+        hits = [0]
+
         class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
+            def _reply(self):
+                status, ctype, body = seq[min(hits[0], len(seq) - 1)]
+                hits[0] += 1
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_GET(self):
+                self._reply()
+
+            def do_POST(self):
+                # 请求体必须读掉：留在缓冲区里，下一个请求会把它当协议行解析。
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                self._reply()
+
             def log_message(self, *a):
                 pass
 
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        httpd.hits = hits
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         started.append(httpd)
         return "http://127.0.0.1:%d" % httpd.server_address[1]
@@ -1427,20 +1453,28 @@ def test_cli_default_url_is_the_panel_port():
     assert getattr(get.args[1], "id", None) == "DEFAULT_URL"
 
 
-def test_cli_stats_follows_the_servers_columns(stub_server, monkeypatch):
+@pytest.mark.parametrize("body,want,unwanted,want_blocked", [
+    # 服务端少给一个状态键：不能拿 LABEL 的列序补一列假数出来
+    (b'{"counts": {"idea": 2, "brandnew": 1}, "blocked": 1}',
+     "仅有创意 2 | brandnew 1", "正在明确", "阻塞中：1"),
+    # 服务端连 blocked 都没给（s.get 的缺省那半边）
+    (b'{"counts": {"idea": 2}}', "仅有创意 2", "正在明确", "阻塞中：0"),
+])
+def test_cli_stats_follows_the_servers_columns(
+        stub_server, monkeypatch, body, want, unwanted, want_blocked):
     """服务端少给一个状态键时，不能吐栈，也不能拿 LABEL 的列序凑数。
 
     照 LABEL 遍历是当场 KeyError（SPEC 第 9 节禁止的满屏栈）；而"补个 0 蒙混
     过去"更坏——面板上会多出一列账本里根本没有的数，且没人知道它从哪来。
+    第二个变体盯的是 `s.get("blocked", 0)`：写成 `s["blocked"]` 而桩又总带着
+    blocked 的话，那半边就永远红不了。
     """
-    monkeypatch.setenv("PANEL_URL", stub_server(
-        200, "application/json",
-        b'{"counts": {"idea": 2, "brandnew": 1}, "blocked": 1}'))
+    monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json", body))
     r = _cli("stats")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "仅有创意 2 | brandnew 1" in r.stdout   # 列序跟服务端；翻不出来的显示原 key
-    assert "正在明确" not in r.stdout             # 反向：服务端没给的就不该有这一列
-    assert "阻塞中：1" in r.stdout
+    assert want in r.stdout                # 列序跟服务端；翻不出来的显示原 key
+    assert unwanted not in r.stdout        # 反向：服务端没给的就不该出现
+    assert want_blocked in r.stdout
     assert "Traceback" not in r.stdout + r.stderr
 
 
@@ -1459,11 +1493,108 @@ def test_cli_wrong_shape_on_the_success_path_is_still_one_human_line(
         stub_server, monkeypatch, args, body):
     """**成功**路径的形状不对也必须是人话，不是解析异常。
 
-    这是"错误响应读不出来"的另一半：上一轮只修了 4xx/5xx 那一半，200 里
-    顶着一个数组照样满屏栈——SPEC 第 9 节禁的是栈，不管它从哪条路漏出来。
+    这是"错误响应读不出来"的另一半：只修了 4xx/5xx 那一半，200 里顶着一个
+    数组照样满屏栈——SPEC 第 9 节禁的是栈，不管它从哪条路漏出来。
     """
     monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json", body))
     r = _cli(*args)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "请确认 PANEL_URL 指向面板" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def _idea_json(**over):
+    d = {"id": 1, "title": "分镜表", "status": "idea", "blocked": 0,
+         "blocked_note": "", "tags": ",", "body": "", "events": []}
+    d.update(over)
+    return json.dumps(d).encode("utf-8")
+
+
+def _row_json(**over):
+    d = {"id": 1, "status": "idea", "title": "分镜表", "blocked": 0}
+    d.update(over)
+    return json.dumps([d]).encode("utf-8")
+
+
+@pytest.mark.parametrize("args,body", [
+    # 进 "#%d" 的必须是整数——键在、类型不对是最隐蔽的一种漏栈
+    (("show", "1"), _idea_json(id="abc")),
+    (("list",), _row_json(id="abc")),
+    (("new", "分镜表"), _idea_json(id="abc")),
+    # 进 .strip() / .replace() 的必须是文本
+    (("show", "1"), _idea_json(tags=5)),
+    (("show", "1"), _idea_json(body=7)),
+    (("show", "1"), _idea_json(title=["分镜表"])),
+    # 进 label() 的键要是文本：list 当键会抛 unhashable
+    (("show", "1"), _idea_json(status=[])),
+    (("list",), _row_json(status=[])),
+    (("advance", "1", "building"), _idea_json(status=[])),
+    # 时间线上的同一批敏感位置：created_at 要能切片，actor/是 label() 那类
+    # dict.get 的键（list 当键是 unhashable）
+    (("show", "1"), _idea_json(events=[{"actor": "agent", "kind": "note",
+                                        "created_at": 5, "message": "备注",
+                                        "from_status": None,
+                                        "to_status": None}])),
+    (("show", "1"), _idea_json(events=[{"actor": [], "kind": "note",
+                                        "created_at": "2026-10-12T15:18:32.1",
+                                        "message": "备注",
+                                        "from_status": None,
+                                        "to_status": None}])),
+])
+def test_cli_wrong_field_type_on_the_success_path_is_still_one_human_line(
+        stub_server, monkeypatch, args, body):
+    """字段**在**但类型不对，也得是人话——上一轮只查了键在不在。
+
+    这些不是假想：%d、.strip()、.replace()、dict.get(不可哈希的键) 全都会
+    抛 TypeError/AttributeError，和漏栈是一回事。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json", body))
+    r = _cli(*args)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "请确认 PANEL_URL 指向面板" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("args,body,absent", [
+    (("show", "1"), _idea_json(tags=None), "标签："),
+    (("show", "1"), _idea_json(body=None), "描述："),
+    (("show", "1"), _idea_json(blocked=1, blocked_note=None), "已阻塞：None"),
+])
+def test_cli_null_optional_text_is_shown_as_empty(
+        stub_server, monkeypatch, args, body, absent):
+    """tags/body 这类可选文本收到 null：**当作没填**，不是当成错。
+
+    本面板的列是 NOT NULL，正常走不到 null；但"没有标签"在显示层就是没有，
+    不该因为对面少个键就甩一句错给 agent。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json", body))
+    r = _cli(*args)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "仅有创意" in r.stdout
+    assert absent not in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_advance_status_field_type_is_checked(stub_server, monkeypatch):
+    """推进**成功**那条路上的 status：CLI 自己打回的不合格键一样要拦。
+
+    形态是"推进到当前状态"：POST 吃 422，再 GET 补读——补读回来的 status
+    同样要查类型，否则 label() 会拿它当 dict 键，unhashable 就漏栈。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json",
+                                               _idea_json(status=[])))
+    r = _cli("advance", "1", "building")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "请确认 PANEL_URL 指向面板" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_already_in_status_lookup_shape_is_checked(stub_server, monkeypatch):
+    """同上，但走的是 422 补读那条路（POST 先吃 422，再 GET 拿状态）。"""
+    monkeypatch.setenv("PANEL_URL", stub_server(
+        (422, "application/json", b'{"detail": "\\u8be5\\u521b\\u610f\\u5df2\\u7ecf\\u5904\\u4e8e\\u6b64\\u72b6\\u6001"}'),
+        (200, "application/json", _idea_json(status=[]))))
+    r = _cli("advance", "1", "building")
     assert r.returncode == 1, r.stdout + r.stderr
     assert "请确认 PANEL_URL 指向面板" in r.stdout
     assert "Traceback" not in r.stdout + r.stderr
