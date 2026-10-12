@@ -18,14 +18,24 @@ class Invalid(Exception):
 FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
 
 
-def _not_null(v, what):
-    """null 一律拒（SPEC 5.1：清空请传空串）。
+_FIELD_LABEL = {"title": "标题", "body": "描述", "source": "来源",
+                "tags": "标签", "blocked_note": "阻塞备注"}
 
-    ideas.body/source/blocked_note 与 events.actor/message 都是 NOT NULL 列，
-    漏下去就是 sqlite3.IntegrityError -> Task 3 返 500 而不是 422。
+
+def _text(v, what):
+    """写入 NOT NULL 文本列的入参统一收口。
+
+    null 与类型错误是两回事，文案也必须分开（SPEC 5.1 / 5.4）：null 说"请传空串"，
+    类型错说"必须是字符串"。混成一条的话，客户端拿到 422 也看不懂自己错在哪——
+    Task 3 把 detail 原样返给客户端。
+
+    类型这条不是防御性洁癖：list/dict 会漏出 sqlite3.ProgrammingError（500），
+    而 int/float/bool 会被 TEXT 亲和性静默转成字符串（title=True 落库成 "1"）。
     """
     if v is None:
-        raise Invalid("%s 不能为 null，清空请传空字符串" % what)
+        raise Invalid("%s 不能为 null，请传空串" % what)
+    if not isinstance(v, str):
+        raise Invalid("%s 必须是字符串" % what)
     return v
 
 
@@ -61,8 +71,8 @@ def _row(c, r):
 
 def add_event(c, idea_id, kind, actor, message="", from_status=None, to_status=None):
     # actor/message 走这里的是所有事件类写入口，统一在收口处挡 null
-    actor = _not_null(actor, "actor")
-    message = _not_null(message, "事件内容")
+    actor = _text(actor, "actor")
+    message = _text(message, "事件内容")
     c.execute(
         "INSERT INTO events(idea_id,kind,from_status,to_status,actor,message,created_at)"
         " VALUES(?,?,?,?,?,?,?)",
@@ -78,10 +88,13 @@ def _next_position(c, status):
 
 
 def create_idea(title, body="", tags=None, source="", actor="human", position=None):
-    if not (title or "").strip():
+    if title is None:              # null 视同"没给标题"，走 SPEC 错误表那条文案
         raise Invalid("标题不能为空")
-    body = _not_null(body, "描述")
-    source = _not_null(source, "来源")
+    title = _text(title, "标题")   # 非字符串在这里挡，否则下面 .strip() 抛 AttributeError
+    if not title.strip():
+        raise Invalid("标题不能为空")
+    body = _text(body, "描述")
+    source = _text(source, "来源")
     tags_v = _parse_tags(tags)
     c = db.connect()
     try:
@@ -146,8 +159,10 @@ def update_idea(idea_id, fields, actor="human"):
     bad = [k for k in fields if k not in FIELDS]
     if bad:
         raise Invalid("不支持的字段：%s（状态请用 /advance）" % "、".join(bad))
-    if any(v is None for v in fields.values()):
-        raise Invalid("字段不能为 null，请传空串")
+    for k, v in fields.items():
+        # position 是 REAL、tags 由 _parse_tags 独家处理，这俩不走文本校验
+        if k not in ("position", "tags"):
+            _text(v, _FIELD_LABEL.get(k, k))
     if "tags" in fields:
         fields = dict(fields, tags=_parse_tags(fields["tags"]))
     c = db.connect()
@@ -167,6 +182,7 @@ def update_idea(idea_id, fields, actor="human"):
 def advance(idea_id, to, note=None, position=None, actor="agent"):
     if to not in db.STATUS_KEYS:
         raise Invalid("未知状态：%s（合法值：%s）" % (to, "、".join(db.STATUS_KEYS)))
+    note = "" if note is None else _text(note, "备注")   # note=None 是合法缺省，不是错
     c = db.connect()
     try:
         r = c.execute("SELECT status FROM ideas WHERE id=?", (idea_id,)).fetchone()
@@ -180,7 +196,7 @@ def advance(idea_id, to, note=None, position=None, actor="agent"):
         pos = _next_position(c, to) if position is None else position
         c.execute("UPDATE ideas SET status=?, position=?, done_at=? WHERE id=?",
                   (to, pos, done_at, idea_id))
-        add_event(c, idea_id, "status", actor, note or "", frm, to)
+        add_event(c, idea_id, "status", actor, note, frm, to)
         c.commit()
     finally:
         c.close()
@@ -201,7 +217,7 @@ def add_note(idea_id, message, actor="agent"):
 
 def block(idea_id, reason, actor="agent"):
     """允许重复：覆盖 note，每次都留痕（SPEC 5.6）。"""
-    reason = _not_null(reason, "阻塞原因")   # 必须在 UPDATE 之前挡，否则撞 NOT NULL
+    reason = _text(reason, "阻塞原因")   # 必须在 UPDATE 之前挡，否则撞 NOT NULL
     c = db.connect()
     try:
         if not c.execute("SELECT 1 FROM ideas WHERE id=?", (idea_id,)).fetchone():

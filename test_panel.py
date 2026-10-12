@@ -451,6 +451,8 @@ def test_blank_tags_message_still_human(conn):
     lambda i: block(i, None),
     lambda i: block(i, "r", actor=None),
     lambda i: unblock(i, actor=None),
+    lambda i: update_idea(i, {"title": "ok"}, actor=None),
+    lambda i: advance(i, "clarifying", actor=None),
 ])
 def test_null_params_raise_invalid(call, conn):
     a = create_idea("seed")["id"]
@@ -477,3 +479,101 @@ def test_empty_string_still_allowed(conn):
     assert block(a["id"], "")["blocked_note"] == ""
     assert add_note(a["id"], "")["events"][-1]["message"] == ""
     assert create_idea("y", body="", source="")["body"] == ""
+
+
+# --- 修复轮 2：非字符串入参不得漏出 sqlite3 异常 ------------------------------
+# 两种坏法：list/dict 漏 sqlite3.ProgrammingError；标量被 TEXT 亲和性静默强转
+# （title=True 会落库成 "1"）。前者是 500，后者是无声的数据损坏，更坏。
+
+
+@pytest.mark.parametrize("bad", [5, ["视频"], True])   # 标量静默强转 / list 绑定失败
+@pytest.mark.parametrize("call", [
+    lambda i, b: create_idea(b),
+    lambda i, b: create_idea("x", body=b),
+    lambda i, b: create_idea("x", source=b),
+    lambda i, b: add_note(i, b),
+    lambda i, b: block(i, b),
+    lambda i, b: advance(i, "clarifying", note=b),
+])
+def test_non_string_text_params_raise_invalid(call, bad, conn):
+    """title/body/source/message/reason/note 都是 JSON 可达的，必须 422 不是 500。"""
+    a = create_idea("seed")["id"]
+    with pytest.raises(Invalid):
+        call(a, bad)
+
+
+@pytest.mark.parametrize("bad", [5, ["x"]])
+@pytest.mark.parametrize("field", ["title", "body", "source", "blocked_note"])
+def test_update_idea_non_string_text_raises_invalid(field, bad, conn):
+    a = create_idea("seed")
+    with pytest.raises(Invalid):
+        update_idea(a["id"], {field: bad})
+    got = get_idea(a["id"])
+    assert got["title"] == "seed"                   # 没落库
+    assert [e["kind"] for e in got["events"]] == ["created"]
+
+
+def test_position_is_not_type_checked(conn):
+    """position 是 REAL 列，不能套字符串校验——拖拽传小数必须照常工作。"""
+    a = create_idea("x")
+    assert update_idea(a["id"], {"position": 3.5})["position"] == 3.5
+    assert update_idea(a["id"], {"position": "7"})["position"] == 7.0
+
+
+def test_null_and_type_errors_are_not_one_message(conn):
+    """null 与类型错误是两回事，Task 3 把 detail 原样返给客户端，不能混。"""
+    a = create_idea("seed")["id"]
+    with pytest.raises(Invalid) as n:
+        block(a, None)
+    with pytest.raises(Invalid) as t:
+        block(a, 5)
+    assert "请传空串" in n.value.detail
+    assert "必须是字符串" in t.value.detail
+    assert n.value.detail != t.value.detail
+
+
+def test_null_message_matches_spec_wording(conn):
+    """SPEC 5.4 错误表：422「字段不能为 null，请传空串」。旧文案已全部废止。"""
+    a = create_idea("seed")["id"]
+    for fn in (lambda: create_idea("x", body=None),
+               lambda: add_note(a, None),
+               lambda: block(a, None),
+               lambda: advance(a, "clarifying", actor=None),
+               lambda: update_idea(a, {"source": None})):
+        with pytest.raises(Invalid) as ei:
+            fn()
+        assert "不能为 null，请传空串" in ei.value.detail
+        assert "清空请传空字符串" not in ei.value.detail
+
+
+@pytest.mark.parametrize("bad", [None, "", "   "])
+def test_title_null_and_blank_keep_spec_wording(bad, conn):
+    """null 视同"没给标题"——必须仍走错误表那条，不能被类型校验抢走。"""
+    with pytest.raises(Invalid) as ei:
+        create_idea(bad)
+    assert ei.value.detail == "标题不能为空"
+
+
+def test_advance_note_none_is_still_default(conn):
+    """note=None 是合法缺省（不写备注），不能被 null 校验误伤。"""
+    a = create_idea("x")
+    assert advance(a["id"], "clarifying")["events"][-1]["message"] == ""
+
+
+def test_advance_note_error_names_the_field(conn):
+    """advance 单独挡 note，目的就是报错指到"备注"而不是 add_event 的"事件内容"。
+
+    不钉这条的话 advance 里那行 _text 就是死代码——add_event 的守卫照样会拦。
+    """
+    a = create_idea("seed")["id"]
+    with pytest.raises(Invalid) as ei:
+        advance(a, "clarifying", note=["x"])
+    assert ei.value.detail == "备注 必须是字符串"
+
+
+def test_whitelist_check_precedes_value_check(conn):
+    """白名单外的键先报"不支持的字段"，哪怕它的值类型也不对（SPEC 错误表 443）。"""
+    a = create_idea("seed")["id"]
+    with pytest.raises(Invalid) as ei:
+        update_idea(a, {"status": 5})
+    assert "不支持的字段" in ei.value.detail
