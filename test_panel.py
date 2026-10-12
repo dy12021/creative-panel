@@ -1303,6 +1303,14 @@ def stub_server():
                     self.rfile.read(n)
                 self._reply()
 
+            def do_PATCH(self):
+                # PATCH 同样带 body，也同样必须读掉——漏了它，返回的响应会被
+                # 当成下一个请求的协议行，表现为莫名其妙的连接错误而不是断言失败。
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                self._reply()
+
             def log_message(self, *a):
                 pass
 
@@ -2016,3 +2024,193 @@ def test_cli_list_q_filter_actually_filters(live_server):
 
     both = _cli("list")
     assert "分镜表初稿" in both.stdout and "配乐调研" in both.stdout
+
+
+# --- Task 9 / Part A：CLI `edit`（SPEC 7.2 第 2 步唯一的落笔路径）--------------
+# SPEC 7.2 的 agent 标准流程第 2 步是「brainstorming 结论写进 body」，而
+# brainstorming 发生在建卡**之后**——`new` 只能在建卡那一刻带 body。所以没有
+# `edit` 时那一步根本执行不了，agent 只能请人去网页抽屉里改。
+
+
+def test_cli_edit_writes_the_concluded_body(live_server):
+    """SPEC 7.2 第 2 步的正面路径：聊完需求把结论写回 body。"""
+    iid = _new_id("AI 发展史")
+    r = _cli("edit", iid, "--body", "6 段 H3，每段 90 秒，面向高中生")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "已修改" in r.stdout and "描述" in r.stdout
+    assert store.get_idea(int(iid))["body"] == "6 段 H3，每段 90 秒，面向高中生"
+    assert "描述：6 段 H3，每段 90 秒，面向高中生" in _cli("show", iid).stdout
+
+
+def test_cli_edit_empty_string_clears_and_absent_field_is_untouched(live_server):
+    """**`--body ""` 与不传 `--body` 必须是两件事**——本块最要紧的一条。
+
+    判据若是真值判断（`if a.body:`）而不是 `is not None`，"传空串想清空"会
+    和"没传"一起被丢掉：CLI 退出码 0、输出"已修改"，描述原封不动躺在账本里。
+    退出码和 stdout 都对，**只有回读账本才抓得到**——所以这条断言不查输出。
+    """
+    iid = int(_new_id("分镜表"))
+    before = store.create_idea(title="第二张", body="原始描述",
+                               tags="视频", source="群里")
+    assert store.get_idea(before["id"])["body"] == "原始描述"
+
+    r = _cli("edit", str(before["id"]), "--body", "")
+    assert r.returncode == 0, r.stdout + r.stderr
+    cleared = store.get_idea(before["id"])
+    assert cleared["body"] == ""            # 空串 = 清空
+
+    # 反向断言的对照组：只改 source 时，已清空的 body 不能再被"顺手重置"回去，
+    # 没传的三个字段也一律不许动。这半句不可省——没有它，上面那句恒真。
+    r = _cli("edit", str(before["id"]), "--source", "换了来源")
+    assert r.returncode == 0, r.stdout + r.stderr
+    after = store.get_idea(before["id"])
+    assert after["body"] == ""              # 没传 --body，所以没被动
+    assert after["title"] == "第二张"
+    assert after["tags"] == ",视频,"
+    assert after["source"] == "换了来源"
+
+
+def test_cli_edit_sends_only_the_fields_given_on_the_command_line(live_server):
+    """反向断言（正面）：payload 里不能混进没传的字段。
+
+    SPEC 5 的 PATCH 语义是"只有你传了的字段才改"。实现最容易犯的懒是把
+    payload 凑成全部六项、没传的用 `a.title or 初始值` 之类的兜底填进去——
+    那会把用户没打算改的字段覆盖掉。这里看 **event 的 message**：store 记的
+    就是 CLI 发过去的键，逐字对得上才算没多发。
+    """
+    iid = int(_new_id("配乐调研"))
+    _cli("edit", str(iid), "--title", "配乐调研（改）", "--source", "群里")
+    events = store.get_idea(iid)["events"]
+    edited = [e for e in events if e["kind"] == "edited"]
+    assert len(edited) == 1
+    # EDIT_FIELDS 序 → title、source。body/tags/blocked_note/position 一个都不许在。
+    assert edited[0]["message"] == "修改了：title、source"
+    for absent in ("body", "tags", "blocked_note", "position"):
+        assert absent not in edited[0]["message"]
+
+
+def test_cli_edit_does_not_claim_fields_it_did_not_change(live_server):
+    """输出念的必须是**发了的**字段，不是响应里的全部字段。
+
+    反向断言。变异测试实证：把 `names` 改成 `list(EDIT_FIELDS)`（即无条件念全
+    六个字段名）时，上面那条 event 断言照样绿——因为账本记的是对的，**只有
+    stdout 在撒谎**。
+
+    这条谎报的代价很实：agent 看到"已修改：标题、描述、标签、来源、阻塞备注、
+    排序位置"，会认为六项都落库了，而实际只有一项被碰过。面板的全部价值就是
+    账本可信，所以嘴上说的和账上记的必须一致。
+    """
+    iid = int(_new_id("只改标题的卡"))
+    r = _cli("edit", str(iid), "--title", "只改标题的卡（改）")
+    assert r.returncode == 0, r.stdout + r.stderr
+    said = r.stdout.splitlines()[0]
+    assert "标题" in said
+    for never_given, cn in (("描述", None), ("标签", None), ("来源", None),
+                            ("阻塞备注", None), ("排序位置", None)):
+        assert never_given not in said, "念了没发过的字段：%s" % never_given
+
+
+def test_cli_edit_several_fields_in_one_call_write_one_event(live_server):
+    """SPEC 5.5：一次 PATCH 无论改几个字段，只写一条 edited。"""
+    iid = int(_new_id("分镜"))
+    r = _cli("edit", str(iid), "--title", "分镜表", "--body", "第一幕夜车",
+             "--tags", "视频,分镜")
+    assert r.returncode == 0, r.stdout + r.stderr
+    row = store.get_idea(iid)
+    assert (row["title"], row["body"], row["tags"]) == ("分镜表", "第一幕夜车",
+                                                        ",视频,分镜,")
+    assert [e["kind"] for e in row["events"]] == ["created", "edited"]
+    assert row["events"][-1]["message"] == "修改了：title、body、tags"
+
+
+def test_cli_edit_echoes_the_new_title(live_server):
+    """改了标题要说清新标题是什么，否则 agent 得再 show 一次才知道。"""
+    iid = _new_id("旧标题")
+    r = _cli("edit", iid, "--title", "新标题")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "新标题" in r.stdout
+
+
+@pytest.mark.parametrize("args,fragment", [
+    (("edit", "1"), "没有可更新的字段"),              # 空对象 → 空 payload
+    (("edit", "999", "--body", "x"), "没有 #999"),   # id 不存在
+    (("edit", "1", "--position", "abc"), "排序位置 必须是数字"),
+])
+def test_cli_edit_server_errors_are_human(live_server, args, fragment):
+    """服务端 detail 原样透传 + 退出码 1 + 无栈（SPEC 第 9 节）。"""
+    iid = _new_id("占位卡")
+    args = [str(iid) if a == "1" else a for a in args]
+    r = _cli(*args)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert fragment in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_edit_never_sends_null_because_it_cannot_express_it(
+        stub_server, monkeypatch):
+    """**CLI 结构上发不出 null**——所以 null 守卫（SPEC 5.5）从 CLI 侧够不着。
+
+    这是 `edit` 设计的结果而不是漏洞：argparse 的一切都是文本，`--body None`
+    传出去是字符串 `"None"` 而不是 JSON null。断言的是"这条路上没有 null"，
+    所以服务端那条 422 只能由网页端触发。
+
+    顺带钉住透传：detail 原样打给人看，不加壳、不吞掉。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(
+        422, "application/json",
+        json.dumps({"detail": "描述 不能为 null，请传空串"},
+                   ensure_ascii=False).encode("utf-8")))
+    r = _cli("edit", "1", "--body", "x")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert r.stdout.strip() == "描述 不能为 null，请传空串"
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_edit_has_no_status_option(live_server):
+    """status 的唯一入口是 advance（SPEC 5.1）。CLI 层就得没有 --status，
+    否则等于给"改状态"开了一个会被服务端 422 挡住的旁门。"""
+    r = _cli("edit", "1", "--status", "done")
+    assert r.returncode != 0
+    assert "已修改" not in r.stdout
+    assert store.get_idea(int(_new_id("不该被动")))["status"] == "idea"
+
+
+def test_cli_edit_field_table_matches_the_server():
+    """EDIT_FIELDS / FIELD_LABEL 两份拷贝必须与 store 逐字相同。
+
+    同 LABEL 的理由（install_skill.bat 只同步 skill/，那边 import 不到
+    server/store.py）：字段表漂移的后果是 CLI 把一个字段改名/漏掉，用户改了
+    半天发现没改到，或者把 A 字段的值写进 B 字段——账本上还是 200 + 一条
+    "已修改"，正是这个面板最不能有的静默错误。
+    """
+    fields = ast.literal_eval(_panel_assign("EDIT_FIELDS").value)
+    labels = ast.literal_eval(_panel_assign("FIELD_LABEL").value)
+    assert tuple(fields) == tuple(store.FIELDS)        # 顺序也是契约（输出念它）
+    assert labels == store._FIELD_LABEL
+    assert set(labels) == set(fields)                  # 少一个就是"念不出来"
+
+
+def test_cli_edit_wrong_shape_on_the_success_path_is_still_one_human_line(
+        stub_server, monkeypatch):
+    """PATCH 回的响应形状不对时同样是人话，不是解析异常（SPEC 第 9 节）。"""
+    monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json",
+                                                 b'[{"id": 1}]'))
+    r = _cli("edit", "1", "--body", "x")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "请确认 PANEL_URL 指向面板" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_edit_field_type_on_the_success_path_is_checked(
+        stub_server, monkeypatch):
+    """id 进 "%d"、title 要能拼串——类型不对时收口成人话。
+
+    少了这条：把 `_obj(...)` 的 types= 整个删掉，六条 edit 测试照样全绿，
+    只在 PANEL_URL 指到别的服务时才炸成一屏栈。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(
+        200, "application/json", _idea_json(id="abc")))
+    r = _cli("edit", "1", "--body", "x")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "类型不对" in r.stdout and "请确认 PANEL_URL 指向面板" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr

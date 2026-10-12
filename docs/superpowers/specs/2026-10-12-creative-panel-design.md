@@ -289,6 +289,8 @@ agent 的操作入口，是 REST API 的薄封装。输出给人看，不输出 
 ```bash
 python panel.py new "<标题>" [--body 描述] [--tags a,b] [--source 来源]
 python panel.py list [--status <态>] [--tag <标签>] [--q <关键词>] [--blocked]
+python panel.py edit <id> [--title <标题>] [--body <描述>] [--tags a,b]
+                    [--source <来源>] [--blocked-note <备注>] [--position <位次>]
 python panel.py show <id>
 python panel.py advance <id> <状态> [--note "这步做了什么"]
 python panel.py note <id> "<消息>"
@@ -297,6 +299,8 @@ python panel.py unblock <id>
 python panel.py stats
 python panel.py delete <id>
 ```
+
+`edit` 打 `PATCH /api/ideas/{id}`，可改字段就是白名单那六个（见第 5 节），没有 `--status`——状态仍只能走 `advance`（5.1）。**没传的字段不进请求体**（PATCH 语义是"只有你传了的字段才改"），所以服务端那几个 422 分支（空对象、白名单外、null）在 CLI 上够不着——CLI 结构上发不出 JSON null，argparse 的一切都是文本。空对象只有 `edit <id>` 一个字段都不给时才会发生，服务端回「没有可更新的字段」，CLI 原样透传。`--body ""` 是**清空描述**，与不传是两件事：CLI 靠 argparse 的默认值（没传 = `None`，传空串 = `""`）区分，判据必须是 `is not None` 而不是真值判断。
 
 输出示例：
 

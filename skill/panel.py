@@ -30,6 +30,17 @@ HEADERS = {"X-Panel-Actor": "agent"}
 LABEL = {"idea": "仅有创意", "clarifying": "正在明确", "clarified": "已经明确",
          "building": "正在制作", "done": "完成成品"}
 
+# `edit` 能改哪些字段：就是 PATCH 的白名单（SPEC 5），不多不少。
+# 白名单外的字段服务端一律 422，所以这里重复校验没有意义；**顺序**要定死，
+# 用来念"改了哪几个字段"。这份表与 store.FIELDS 的一致性由测试上锁。
+EDIT_FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
+
+# 字段名的中文显示，**只用于显示**，跟 LABEL 是同一个理由：安装目录里没有
+# server/store.py 可 import，这份拷贝无法避免，靠 test_cli_edit_field_table_
+# matches_the_server 锁住漂移（标签被复用给另一个字段比缺个翻译更毒）。
+FIELD_LABEL = {"title": "标题", "body": "描述", "source": "来源",
+               "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置"}
+
 # events.kind 同样只用于显示。时间线是给 agent 读的一行人话，
 # "note / edited" 这种裸枚举混在里面等于让调用方再翻译一遍。
 KIND = {"created": "创建", "status": "推进", "note": "备注",
@@ -191,6 +202,16 @@ def build_parser():
     l.add_argument("--q")
     l.add_argument("--blocked", action="store_true", help="只看卡住的")
 
+    e = sub.add_parser("edit", help="改标题/描述/标签/来源等，不改状态")
+    e.add_argument("id")
+    e.add_argument("--title")
+    e.add_argument("--body")
+    e.add_argument("--tags")
+    e.add_argument("--source")
+    e.add_argument("--blocked-note", dest="blocked_note",
+                   help="改阻塞备注文字，不改卡住与否（那是 block/unblock 的活）")
+    e.add_argument("--position", help="排到本列第几位，数字")
+
     s = sub.add_parser("show", help="看一张卡的详情与时间线")
     s.add_argument("id")
 
@@ -221,6 +242,50 @@ def main(argv=None):
     except Fail as e:
         print(str(e))
         return 1
+
+
+def _edit_payload(a):
+    """只把**命令行上真给了**的字段放进 PATCH 的 body。
+
+    SPEC 5 的 PATCH 语义是「只有你传了的字段才改」，而 argparse 的默认值恰好
+    就是这件事需要的那个区分：没写 `--body` 拿到 None，写了 `--body ""` 拿到
+    空串。所以判据只能是 `is not None`——用真值判断（`if a.body:`）会把"传了
+    空串想清空"和"没传"混成一谈，agent 就再也清不掉描述了。
+
+    返回空 dict 时**照样发出去**，让服务端回「没有可更新的字段」。CLI 不自己
+    抄这条规则：它和 5.5 那一串边界（null 422、白名单外 422、空对象 422）一样
+    属于服务端契约，本地拦等于养一份会和 store.py 分叉的拷贝。
+    """
+    payload = {}
+    for k in EDIT_FIELDS:
+        v = getattr(a, k, None)
+        if v is not None:
+            payload[k] = v
+    return payload
+
+
+def _edit(a):
+    payload = _edit_payload(a)
+    # position 是 REAL 列，服务端只收数字（store._num 拒字符串）。命令行传的
+    # 一定是文本，转一下再发；转不动（用户写了字母）就原样发出去让服务端回
+    # 422「排序位置 必须是数字」——CLI 不维护第二套合法性判断。
+    if isinstance(payload.get("position"), str):
+        try:
+            payload["position"] = float(payload["position"])
+        except ValueError:
+            pass
+    d = _obj(call("PATCH", "/api/ideas/%s" % a.id, json=payload),
+             "修改结果", "id", "title", "status",
+             types={"id": int, "title": str, "status": str})
+    # 念**发出去的那些键**，不是响应的全部字段——响应带着整张卡，把没改过的
+    # 字段也念一遍等于谎报「已修改」。这串与账本里那条 `edited` event 的
+    # message（"修改了：body、tags"）一一对应，键序也相同：payload 按
+    # EDIT_FIELDS 构造，store 照 dict 序拼 message。
+    names = [k for k in EDIT_FIELDS if k in payload]
+    print("✔ #%d 已修改：%s" % (d["id"], "、".join(
+        FIELD_LABEL.get(k, k) for k in names)))
+    if "title" in payload:
+        print("    标题现在是：%s" % d["title"])
 
 
 def _advance(a):
@@ -331,6 +396,8 @@ def dispatch(a):
                                               label(d["status"])))
     elif c == "list":
         _list(a)
+    elif c == "edit":
+        _edit(a)
     elif c == "show":
         _show(a)
     elif c == "advance":
