@@ -15,14 +15,18 @@ import sys
 
 import httpx
 
-BASE_URL = os.environ.get("PANEL_URL", "http://127.0.0.1:8472").rstrip("/")
+# 缺省是本机面板的端口（SPEC 6）。单独拎一个常量是为了让白盒测试能把它读
+# 出来——这个值是契约，不是一个随手写的字面量。
+DEFAULT_URL = "http://127.0.0.1:8472"
+BASE_URL = os.environ.get("PANEL_URL", DEFAULT_URL).rstrip("/")
 HEADERS = {"X-Panel-Actor": "agent"}
 
-# 只用于把服务端返回的 key 翻成中文显示，**不做校验**。合法状态由
-# db.STATUS_KEYS 说了算；CLI 侧再维护一份表就会和它分叉——面板改列序时
-# 这份表还按旧顺序翻译，且拒掉服务端新加的状态。
-# （这份拷贝是刻意的：install_skill.bat 只同步 skill/ 目录到
-# %USERPROFILE%\.minimax\skills\，那里没有 server/db.py 可 import。）
+# 只用于把服务端返回的 key 翻成中文显示，**不做校验、也不定列序**
+# （列序跟着服务端走，见 _stats）。合法状态由 db.STATUS_KEYS 说了算；
+# 面板新加一个状态，这里只是少一个翻译——那个 key 会原样显示，不影响可用。
+# （这份拷贝没法避免：install_skill.bat 只同步 skill/ 目录到
+# %USERPROFILE%\.minimax\skills\，那边没有 server/db.py 可 import。
+# 漂移由 test_cli_label_table_matches_the_server 上锁。）
 LABEL = {"idea": "仅有创意", "clarifying": "正在明确", "clarified": "已经明确",
          "building": "正在制作", "done": "完成成品"}
 
@@ -63,6 +67,33 @@ def _to_key(text):
     return text
 
 
+def _obj(value, where, *keys):
+    """确认一段响应是该有的形状，原样返回；形状不对就 Fail。
+
+    SPEC 第 9 节禁的是「Python 栈甩给 agent」，那不只发生在**错误**响应上：
+    PANEL_URL 指到别的服务、服务端比 CLI 新一版，200 里都可能是个数组或者少
+    了字段。那时 `d["counts"]` 这种直接下标抛的是 TypeError/KeyError，
+    和 JSONDecodeError 一样是满屏栈。成功路径也得说一句人话。
+    """
+    if not isinstance(value, dict) or any(k not in value for k in keys):
+        raise Fail("面板返回的%s不是预期格式（需要：%s），请确认 PANEL_URL 指向面板"
+                   % (where, "、".join(keys)))
+    return value
+
+
+def _num(v, where):
+    """把服务端给的数字转成人看的整数。
+
+    `"%d" % "abc"` 抛的是 TypeError——形状对但类型不对时一样会漏栈，
+    所以这个收口不能省。
+    """
+    try:
+        return "%d" % int(v)
+    except (TypeError, ValueError):
+        raise Fail("面板返回的%s不是数字（%r），请确认 PANEL_URL 指向面板"
+                   % (where, v))
+
+
 def _detail_of(r):
     """把错误响应压成一句人话。**永远不抛**。
 
@@ -94,9 +125,11 @@ def call(method, path, **kw):
     try:
         r = httpx.request(method, BASE_URL + path, headers=HEADERS,
                           timeout=TIMEOUT, **kw)
-    except httpx.RequestError:
+    except (httpx.RequestError, httpx.InvalidURL):
         # 连接被拒 / 读超时都归到这一句：本机面板不会自己慢到超时，
         # 见到这个错就说明没起来（SPEC 第 9 节第一行）。
+        # InvalidURL 不继承 RequestError（PANEL_URL 手输成 `http://[::1`
+        # 就是它），漏掉的话那边照样吐栈。
         raise Fail("面板未启动，请双击 start.bat")
     if r.status_code >= 400:
         raise Fail(_detail_of(r), status=r.status_code)
@@ -183,18 +216,27 @@ def _advance(a):
         # 服务端只说「该创意已经处于此状态」，没说是哪个状态——对调用方没用。
         # 补读一次把状态名翻成人话（SPEC 6 点名的翻译）。
         if e.status == 422 and "已经处于此状态" in str(e):
-            cur = call("GET", "/api/ideas/%s" % a.id)
+            cur = _obj(call("GET", "/api/ideas/%s" % a.id), "创意详情", "status")
             raise Fail("#%s 已经在『%s』了" % (a.id, label(cur["status"])))
         raise
-    print("✔ #%s 已推进，当前状态：%s" % (a.id, label(d["status"])))
+    print("✔ #%s 已推进，当前状态：%s"
+          % (a.id, label(_obj(d, "推进结果", "status")["status"])))
     if a.note:
         print("    %s" % a.note)
 
 
 def _timeline(events):
-    for e in events:
+    if not isinstance(events, list):
+        raise Fail("面板返回的时间线不是一个列表，请确认 PANEL_URL 指向面板")
+    for raw in events:
+        e = _obj(raw, "时间线里的一条",
+                 "actor", "kind", "created_at", "message",
+                 "from_status", "to_status")
         who = ACTOR.get(e["actor"], e["actor"])
         ts = e["created_at"]
+        if not isinstance(ts, str):
+            raise Fail("面板返回的事件时间不是文本（%r），请确认 PANEL_URL 指向面板"
+                       % (ts,))
         # "2026-10-12T15:18:32.123" -> "10-12 15:18"：中间那个 T 是 ISO
         # 格式留下的，不去掉就不是给人看的。
         when = "%s %s" % (ts[5:10], ts[11:16])
@@ -207,7 +249,9 @@ def _timeline(events):
 
 
 def _show(a):
-    d = call("GET", "/api/ideas/%s" % a.id)
+    d = _obj(call("GET", "/api/ideas/%s" % a.id), "创意详情",
+             "id", "title", "status", "blocked", "blocked_note",
+             "tags", "body", "events")
     print("#%d「%s」  状态=%s%s" % (d["id"], d["title"], label(d["status"]),
                                     "  已阻塞：%s" % d["blocked_note"]
                                     if d["blocked"] else ""))
@@ -223,26 +267,38 @@ def _list(a):
     items = call("GET", "/api/ideas", params={
         "status": _to_key(a.status) if a.status else None,
         "tag": a.tag, "q": a.q, "blocked": "1" if a.blocked else None})
+    if not isinstance(items, list):
+        raise Fail("面板返回的创意列表不是一个列表，请确认 PANEL_URL 指向面板")
     if not items:
         print("（没有符合条件的创意）")
         return
-    for d in items:
+    for raw in items:
+        d = _obj(raw, "列表里的一条", "id", "status", "title", "blocked")
         print("#%-4d %s [%s] %s" % (d["id"], "■" if d["blocked"] else " ",
                                     label(d["status"]), d["title"]))
 
 
 def _stats():
-    s = call("GET", "/api/stats")
-    print("  " + " | ".join("%s %d" % (label(k), s["counts"][k]) for k in LABEL))
-    print("  阻塞中：%d" % s["blocked"])
+    s = _obj(call("GET", "/api/stats"), "统计结果", "counts")
+    counts = s["counts"]
+    if not isinstance(counts, dict):
+        raise Fail("面板返回的统计结果里 counts 不是对象，请确认 PANEL_URL 指向面板")
+    # 列序跟着服务端走：store.stats() 的 counts 是按 db.STATUS_KEYS 造的
+    # dict，顺序天然权威。再抄一份 LABEL 的键序来遍历有两个后果——服务端
+    # 少给一个键就当场 KeyError（满屏栈），而若只补个 0 蒙混过去，面板
+    # 上就会多出一列账本里根本没有的数。
+    print("  " + " | ".join("%s %s" % (label(k), _num(v, "状态「%s」的计数" % k))
+                             for k, v in counts.items()))
+    print("  阻塞中：%s" % _num(s.get("blocked", 0), "阻塞计数"))
 
 
 def dispatch(a):
     c = a.cmd
     if c == "new":
-        d = call("POST", "/api/ideas",
-                 json={"title": a.title, "body": a.body,
-                       "tags": a.tags, "source": a.source})
+        d = _obj(call("POST", "/api/ideas",
+                      json={"title": a.title, "body": a.body,
+                            "tags": a.tags, "source": a.source}),
+                 "新建结果", "id", "title", "status")
         print("✔ 已创建 #%d「%s」  状态=%s" % (d["id"], d["title"],
                                               label(d["status"])))
     elif c == "list":

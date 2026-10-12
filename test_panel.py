@@ -1,6 +1,8 @@
 """创意面板后端回归测试。设计依据 SPEC 第 11 节。"""
+import ast
 import importlib
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -1377,3 +1379,174 @@ def test_cli_unreadable_response_is_still_one_human_line(
     assert r.returncode == 1
     assert want in r.stdout
     assert unwanted not in r.stdout + r.stderr
+
+
+# --- Task 4 修复轮 1/5：漂移上锁 + 反向断言 + 成功路径的形状兜底 ---------------
+# 上一轮的 CLI 测试几乎全是"该出现的出现了"，没有一条"不该出现的没出现"——
+# 于是把 `list --status` 从 params 里整个删掉（筛选静默失效）、把 stats 的
+# 数字全打成 0、把计数取错，现有测试照样全绿。这一节补的是**红得了**的断言。
+
+
+def _panel_assign(name):
+    """从 skill/panel.py 静态读一个模块级赋值语句。
+
+    刻意**不 import panel.py**：那个模块 import httpx，白盒断言不该被 CLI 的
+    依赖可用性带着走。ast 只解析字面量，不执行任何代码。
+    """
+    tree = ast.parse(PANEL_PY.read_text(encoding="utf-8"))
+    return next(n for n in tree.body
+                if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", None) == name for t in n.targets))
+
+
+def test_cli_label_table_matches_the_server():
+    """两份拷贝必须逐字相同——CLI 测试都是黑盒，抓不到这张表的漂移。
+
+    漂移最毒的形态是**标签被复用给另一个 key**：`_to_key` 会把 agent 输入翻成
+    错误的 key，服务端照单全收——exit 0、无提示、账本记下错状态。面板的全部
+    价值就是账本，所以这张表得锁死（拷贝本身没法消除：安装目录里没有 server/）。
+    """
+    lbl = ast.literal_eval(_panel_assign("LABEL").value)
+    assert lbl == db.STATUS_LABEL
+    assert list(lbl) == db.STATUS_KEYS          # 顺序也是契约（stats 列序照它走）
+
+
+def test_cli_default_url_is_the_panel_port():
+    """PANEL_URL 不设时必须是 8472（SPEC 6 明写），改成 8000 得有人喊一声。
+
+    覆盖开关本身的另一半是**行为**的、且已被覆盖：每条 live_server 测试都得
+    靠 PANEL_URL 才找得到那个随机端口的 uvicorn，去掉它就会连去 8472 而全红。
+    """
+    assert ast.literal_eval(_panel_assign("DEFAULT_URL").value) == \
+        "http://127.0.0.1:8472"
+    base = _panel_assign("BASE_URL").value      # os.environ.get(...).rstrip("/")
+    assert getattr(base, "func", None) is not None
+    assert getattr(base.func, "attr", None) == "rstrip"
+    get = base.func.value                       # os.environ.get("PANEL_URL", …)
+    assert get.args[0].value == "PANEL_URL"
+    assert getattr(get.args[1], "id", None) == "DEFAULT_URL"
+
+
+def test_cli_stats_follows_the_servers_columns(stub_server, monkeypatch):
+    """服务端少给一个状态键时，不能吐栈，也不能拿 LABEL 的列序凑数。
+
+    照 LABEL 遍历是当场 KeyError（SPEC 第 9 节禁止的满屏栈）；而"补个 0 蒙混
+    过去"更坏——面板上会多出一列账本里根本没有的数，且没人知道它从哪来。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(
+        200, "application/json",
+        b'{"counts": {"idea": 2, "brandnew": 1}, "blocked": 1}'))
+    r = _cli("stats")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "仅有创意 2 | brandnew 1" in r.stdout   # 列序跟服务端；翻不出来的显示原 key
+    assert "正在明确" not in r.stdout             # 反向：服务端没给的就不该有这一列
+    assert "阻塞中：1" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("args,body", [
+    (("stats",), b"[1, 2]"),                   # 顶层是数组：s["counts"] 抛 TypeError
+    (("stats",), b'{"blocked": 1}'),            # 少 counts
+    (("stats",), b'{"counts": ["x"], "blocked": 0}'),   # counts 不是对象
+    (("stats",), b'{"counts": {"idea": "abc"}, "blocked": 0}'),  # 数字位置上是文本
+    (("list",), b'{"items": []}'),              # 顶层是对象：for raw in items 拿到的是键
+    (("list",), b'[{"id": 1}]'),                # 少了 status/title/blocked
+    (("show", "1"), b'{"id": 1, "title": "x"}'),
+    (("show", "1"), b'{"id": 1, "title": "x", "status": "idea", "blocked": 0,'
+                    b' "blocked_note": "", "tags": ",", "body": "", "events": {}}'),
+])
+def test_cli_wrong_shape_on_the_success_path_is_still_one_human_line(
+        stub_server, monkeypatch, args, body):
+    """**成功**路径的形状不对也必须是人话，不是解析异常。
+
+    这是"错误响应读不出来"的另一半：上一轮只修了 4xx/5xx 那一半，200 里
+    顶着一个数组照样满屏栈——SPEC 第 9 节禁的是栈，不管它从哪条路漏出来。
+    """
+    monkeypatch.setenv("PANEL_URL", stub_server(200, "application/json", body))
+    r = _cli(*args)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "请确认 PANEL_URL 指向面板" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_bad_base_url_is_still_one_human_line(monkeypatch):
+    """PANEL_URL 手输成 `http://[::1` 抛的是 InvalidURL——它**不继承**
+    RequestError，漏掉就又是满屏栈。"""
+    monkeypatch.setenv("PANEL_URL", "http://[::1")
+    r = _cli("stats")
+    assert r.returncode == 1 and "面板未启动" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_stats_prints_the_numbers_in_server_column_order(live_server):
+    """只断言"某个标签在输出里"的话，数字全 0、列序错位、计数取错都不会红。
+
+    这里整行相等：相邻两列的数字两两不同（1/2、2/0、0/1、1/0），所以列序
+    错一位、或某列取成别人的数，字符串就变。
+    """
+    _new_id("甲")
+    for t in ("乙", "丙"):
+        assert _cli("advance", _new_id(t), "clarifying").returncode == 0
+    b = _new_id("丁")
+    assert _cli("advance", b, "building").returncode == 0
+    assert _cli("block", b, "等授权").returncode == 0
+    r = _cli("stats")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert ("  仅有创意 1 | 正在明确 2 | 已经明确 0 | 正在制作 1 | 完成成品 0"
+            in r.stdout)
+    assert "阻塞中：1" in r.stdout
+
+
+def test_cli_list_status_filter_actually_filters(live_server):
+    """`list --status` 是 9 个子命令里最容易被静默改坏的一个。
+
+    把 status 从 params 里整个删掉就是筛选失效：退出码照样 0，输出照样"看着
+    对"，只是多了几条不该在的卡。上一轮只验了"该出现的出现"。
+    """
+    a = _new_id("在建的片子")
+    b = _new_id("还在想法池")
+    assert _cli("advance", a, "building").returncode == 0
+    r = _cli("list", "--status", "building")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "在建的片子" in r.stdout
+    assert "还在想法池" not in r.stdout and "#%s" % b not in r.stdout
+    # 反向断言的对照组：不带 --status 时两条都得在——否则"没出现"可能只是
+    # 因为压根没建出来，这句断言就恒真了。
+    both = _cli("list")
+    assert "在建的片子" in both.stdout and "还在想法池" in both.stdout
+
+
+def test_cli_list_marks_blocked_rows_and_filters_them(live_server):
+    """`■` 阻塞标记与 `--blocked` 筛选：上一轮一个都没验过。"""
+    a = _new_id("卡住的活")
+    _new_id("没卡的活")
+    assert _cli("block", a, "等授权").returncode == 0
+    rows = {ln.rsplit(" ", 1)[1]: ln
+            for ln in _cli("list").stdout.splitlines() if ln.startswith("#")}
+    assert re.match(r"^#\d+\s+■ \[仅有创意\] 卡住的活$", rows["卡住的活"])
+    assert re.match(r"^#\d+\s+\[仅有创意\] 没卡的活$", rows["没卡的活"])
+    only = _cli("list", "--blocked")
+    assert only.returncode == 0 and "卡住的活" in only.stdout
+    assert "没卡的活" not in only.stdout
+
+
+def test_cli_new_body_and_source_reach_the_ledger(live_server):
+    """--body / --source 从没被走过，`show` 的「描述」分支也就没人验证。
+
+    body/source 不回显在 show 里，所以回读账本本身（store.get_idea）才算数——
+    断言 CLI 的回显只能证明它把自己打了一遍。
+    """
+    r = _cli("new", "分镜表", "--body", "第一幕：夜车外景", "--source", "群里聊的")
+    assert r.returncode == 0, r.stdout + r.stderr
+    iid = int(r.stdout.split("#")[1].split("「")[0])
+    row = store.get_idea(iid)
+    assert row["body"] == "第一幕：夜车外景"
+    assert row["source"] == "群里聊的"
+    assert "描述：第一幕：夜车外景" in _cli("show", str(iid)).stdout
+
+
+def test_cli_empty_title_is_human(live_server):
+    """SPEC 第 9 节点名的「标题不能为空」：CLI 透传 + 退出码 1 + 无栈。"""
+    r = _cli("new", "")
+    assert r.returncode == 1 and "标题不能为空" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
