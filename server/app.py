@@ -10,12 +10,22 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db          # noqa: E402
 import store       # noqa: E402
 
 VERSION = "0.1.0"
+
+# 框架层 HTTP 错误的中文文案。未列出的状态码原样转字符串——宁可短，不要给
+# agent 一句"未知错误"却不说清是什么。
+_HTTP_DETAIL = {
+    400: "请求内容不对",
+    404: "没有这个页面",
+    405: "这个接口不支持这个请求方法",
+    415: "内容类型不对，请发 JSON",
+}
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 ACTORS = ("human", "agent", "system")
 BLOCKED_VALUES = ("0", "1")
@@ -115,6 +125,15 @@ def create_app():
     async def _framework_error(request, exc):
         return JSONResponse(status_code=422,
                             content={"detail": validation_message(exc)})
+
+    # 框架层抛的 HTTPException（405 方法不对、静态目录不存在时的 404 等）默认
+    # detail 是英文短语，于是同一个 {"detail": ...} 字段下混进了非人话——
+    # SPEC 第 9 节承诺 detail 恒为中文字符串，CLI 会把它原样打印给 agent。
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request, exc):
+        return JSONResponse(status_code=exc.status_code,
+                            content={"detail": _HTTP_DETAIL.get(
+                                exc.status_code, str(exc.detail))})
 
     @app.get("/api/health")
     def health():

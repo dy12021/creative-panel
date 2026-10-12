@@ -1167,7 +1167,11 @@ def test_every_endpoint_error_detail_is_a_string(client):
                  client.post("/api/ideas/%d/advance" % i, json={"to": "foobar"}),
                  client.get("/api/ideas?status=foobar"),
                  client.get("/api/ideas?blocked=5"),
-                 client.delete("/api/ideas/999")]
+                 client.delete("/api/ideas/999"),
+                 # 方法不对：框架层默认 detail 是英文 "Method Not Allowed"，
+                 # 漏了这一条就等于 SPEC 第 9 节「detail 恒为人话」留着口子。
+                 client.delete("/api/ideas"),
+                 client.put("/api/health")]
     # 只查错误响应：200 本来就没有 detail 字段。带上成功响应是为了顺带确认
     # 扫描逻辑本身没写错。
     errors = [r for r in responses if r.status_code >= 400]
@@ -1176,6 +1180,23 @@ def test_every_endpoint_error_detail_is_a_string(client):
         detail = r.json().get("detail")
         assert isinstance(detail, str) and detail, (str(r.request.url),
                                                     r.status_code, detail)
+
+
+def test_method_not_allowed_speaks_chinese_not_the_framework_english(client):
+    """405 曾是全项目唯一一句英文 detail，CLI 会把它原样甩给 agent。
+
+    只断言"是字符串"不够——"Method Not Allowed" 也是字符串。必须钉住中文文案。
+    """
+    r = client.delete("/api/ideas")
+    assert r.status_code == 405
+    assert r.json()["detail"] == "这个接口不支持这个请求方法"
+
+
+def test_unknown_path_detail_is_chinese_too(client):
+    """静态目录挂不上时的 404 同走框架层，一并保证是人话。"""
+    r = client.get("/api/nope")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "没有这个页面"
 
 
 @pytest.mark.parametrize("param", ["status", "tag", "q", "blocked"])

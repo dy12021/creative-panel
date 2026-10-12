@@ -80,7 +80,12 @@
 - `position` 是列内顺序。
 - `id` 是 tie-breaker，防浮点相等时顺序抖动。
 
-**`position` 由前端计算，服务端只存不校验。** 前端的拖拽逻辑已经知道落点夹在哪两个邻居之间，取两者 `position` 的中点即可；服务端不重复这套计算，也不对 `position` 的取值范围做检查（本机自用，值再离谱也只是排序怪，不会损坏数据）。新建卡片的 `position` 同理由前端给，缺省为 `COALESCE(该列 MAX(position), 0) + 1`。**注意空列没有最大值，直接写 `MAX(position) + 1` 会得到 NULL，撞上 `NOT NULL` 约束。**
+**`position` 的归属分两种，别混：**
+
+- **新建卡片**：**服务端算**，恒为 `COALESCE(该列 MAX(position), 0) + 1`，**客户端传的 `position` 一律忽略**（POST 不读该字段，有 `test_create_ignores_client_supplied_position` 锁定）。新卡总是落在本列末尾，这个语义没有歧义，也不需要前端参与。
+- **拖拽落位**：**前端算**，因为它知道落点夹在哪两个邻居之间，取两者 `position` 的中点即可；服务端只存不校验，也不对取值范围做检查（本机自用，值再离谱也只是排序怪，不会损坏数据）。拖拽可传 `position`，不传则同样按 `COALESCE(MAX,0)+1` 追加到末尾。
+
+**注意空列没有最大值，直接写 `MAX(position) + 1` 会得到 NULL，撞上 `NOT NULL` 约束。**
 
 中点插入法在长期反复拖拽后会耗尽浮点精度。**重排触发条件**：当插入位置与相邻卡片的 `position` 差值小于 `1e-10` 时，按当前列的 `ORDER BY position, id` 顺序把该列 `position` 重写为 `1, 2, 3, …`。
 
@@ -106,25 +111,13 @@ CREATE TABLE ideas (
   status       TEXT NOT NULL DEFAULT 'idea',
   blocked      INTEGER NOT NULL DEFAULT 0,
   blocked_note TEXT NOT NULL DEFAULT '',
-  tags         TEXT NOT NULL DEFAULT '',   -- 约定：首尾补逗号
+  tags         TEXT NOT NULL DEFAULT ',',   -- 约定：首尾补逗号；无标签存 ','
   source       TEXT NOT NULL DEFAULT '',
   position     REAL NOT NULL DEFAULT 0,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
   done_at      TEXT,
   CHECK (status IN ('idea','clarifying','clarified','building','done'))
-);
-CREATE INDEX idx_ideas_status ON ideas(status);
-
-CREATE TABLE events (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  idea_id     INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
-  kind        TEXT NOT NULL,   -- created|status|note|blocked|unblocked|edited
-  from_status TEXT,
-  to_status   TEXT,
-  actor       TEXT NOT NULL,   -- human|agent|system
-  message     TEXT NOT NULL DEFAULT '',
-  created_at  TEXT NOT NULL
 );
 CREATE INDEX idx_ideas_status ON ideas(status);
 
