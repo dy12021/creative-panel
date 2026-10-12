@@ -557,10 +557,13 @@ def list_ideas(status=None, tag=None, q=None, blocked=None):
     sql = "SELECT * FROM ideas"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY status, position, id"      # 11. tie-breaker
+    # status 按看板列序（CASE），不用字典序；id 是 tie-breaker
+    order_case = " ".join("WHEN ? THEN ?" for _ in db.STATUS_KEYS)
+    sql += (" ORDER BY CASE status %s END, position, id" % order_case)
+    sql_params = args + [x for i, k in enumerate(db.STATUS_KEYS) for x in (k, i)]
     c = db.connect()
     try:
-        return [_row(c, r) for r in c.execute(sql, args)]
+        return [_row(c, r) for r in c.execute(sql, sql_params)]
     finally:
         c.close()
 
