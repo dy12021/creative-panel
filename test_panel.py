@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient  # noqa: E402  仅 HTTP 层那几节用得到
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "server"))
 
@@ -683,3 +684,350 @@ def test_list_ideas_rejects_non_string_filters(conn):
         with pytest.raises(Invalid):
             list_ideas(q=bad)
     assert list_ideas(tag=None) == list_ideas()      # None = 不过滤，仍然合法
+
+
+# --- Task 3：HTTP 层（路由、校验、422/404 文案）-----------------------------
+# 这一节全部经 fastapi.testclient 走真实 HTTP 栈（路由、请求体解析、异常
+# 处理器），而不是直接调 store——store 层已经 109 项覆盖，这里只测"从线上看
+# 到的行为对不对"：状态码、detail 文案、以及有没有漏成 500。
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    """临时 db + 每次全新的 app 实例。
+
+    不 pop/reimport：db.connect() 每次调用都经 db_path() 重读 PANEL_DB，
+    重导入反而会把模块级 `from store import ...` 绑到旧对象上去。
+    环境变量必须先于 import 设置——app.py 模块级有 `app = create_app()`，
+    它会 init_db()，顺序反了就会在真实 data/panel.db 上建表。
+    """
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "c.db"))
+    appm = importlib.import_module("app")
+    return TestClient(appm.create_app())
+
+
+def _body_endpoints(i):
+    """SPEC 第 5 节里所有收 JSON body 的端点，i 为创意 id。"""
+    return [("POST", "/api/ideas"), ("PATCH", "/api/ideas/%d" % i),
+            ("POST", "/api/ideas/%d/advance" % i), ("POST", "/api/ideas/%d/note" % i),
+            ("POST", "/api/ideas/%d/block" % i)]
+
+
+def test_health(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "version": "0.1.0"}       # VERSION 是契约的一部分
+
+
+@pytest.mark.parametrize("payload", [["title"], "title", 5, True])
+def test_json_body_must_be_object(payload, client):
+    """body 必须是对象：数组会让 store.update_idea 拿 list 调 .items() 炸 500。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()
+    for method, url in _body_endpoints(i["id"]):
+        r = client.request(method, url, json=payload)
+        assert r.status_code == 422, (url, payload, r.status_code, r.text)
+
+
+@pytest.mark.parametrize("raw", [b"null", b"[1,2]", b'"s"', b"5", b"{oops", b""])
+def test_raw_body_that_is_not_an_object_is_422(raw, client):
+    """字面量 null / 坏 JSON / 空 body 同样得 422，不能漏成 500。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()
+    for method, url in _body_endpoints(i["id"]):
+        r = client.request(method, url, content=raw,
+                           headers={"content-type": "application/json"})
+        assert r.status_code == 422, (url, raw, r.status_code, r.text)
+
+
+def test_absent_body_is_422(client):
+    i = client.post("/api/ideas", json={"title": "a"}).json()
+    for method, url in _body_endpoints(i["id"]):
+        assert client.request(method, url).status_code == 422, url
+
+
+def test_patch_status_uses_the_wording_spec_names(client):
+    """SPEC 5.1 点名的字面量，不是 store 的通用"不支持的字段"。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.patch("/api/ideas/%d" % i, json={"status": "done"})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "请使用 /advance 接口变更状态"
+
+
+@pytest.mark.parametrize("key", ["blocked", "id", "created_at", "status2"])
+def test_patch_unknown_field_names_the_field(key, client):
+    """白名单外的键要指出是哪个，并提示状态走 advance（SPEC 第 9 节）。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.patch("/api/ideas/%d" % i, json={key: "x"})
+    assert r.status_code == 422
+    assert key in r.json()["detail"] and "/advance" in r.json()["detail"]
+
+
+def test_patch_empty_object_422(client):
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.patch("/api/ideas/%d" % i, json={})
+    assert r.status_code == 422 and r.json()["detail"] == "没有可更新的字段"
+
+
+def test_patch_whitelisted_fields_still_work(client):
+    """正向对照：别把 PATCH 整个写死成 422。一次 PATCH 只写一条 edited。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.patch("/api/ideas/%d" % i,
+                     json={"title": "新标题", "body": "描述", "tags": "视频, 科普",
+                           "source": "刷到的", "blocked_note": "", "position": 2.5},
+                     headers={"X-Panel-Actor": "agent"})
+    assert r.status_code == 200
+    got = r.json()
+    assert got["title"] == "新标题" and got["body"] == "描述"
+    assert got["tags"] == ",视频,科普," and got["source"] == "刷到的"
+    assert got["position"] == 2.5
+    assert [e["kind"] for e in got["events"]] == ["created", "edited"]
+    assert got["events"][-1]["actor"] == "agent"
+
+
+@pytest.mark.parametrize("payload,detail", [
+    ({"title": None}, "标题 不能为 null，请传空串"),
+    ({"body": None}, "描述 不能为 null，请传空串"),
+    ({"tags": None}, "标签 不能为 null，请传空串"),
+    ({"position": None}, "排序位置 不能为 null，请传空串"),
+    ({"source": None}, "来源 不能为 null，请传空串"),
+    ({"blocked_note": None}, "阻塞备注 不能为 null，请传空串"),
+    ({"title": ["a"]}, "标题 必须是字符串"),
+    ({"body": 5}, "描述 必须是字符串"),
+    ({"source": True}, "来源 必须是字符串"),
+    ({"tags": ["a"]}, "标签必须是逗号分隔的字符串"),
+    ({"position": "1"}, "排序位置 必须是数字"),
+    ({"position": True}, "排序位置 必须是数字"),
+])
+def test_patch_null_and_type_use_chinese_field_names(payload, detail, client):
+    """文案带中文字段名，且被拒的 PATCH 不能落库、不能写 edited。"""
+    i = client.post("/api/ideas", json={"title": "原始", "tags": "视频"}).json()["id"]
+    r = client.patch("/api/ideas/%d" % i, json=payload)
+    assert r.status_code == 422 and r.json()["detail"] == detail
+    after = client.get("/api/ideas/%d" % i).json()
+    assert after["title"] == "原始" and after["tags"] == ",视频,"
+    assert [e["kind"] for e in after["events"]] == ["created"]
+
+
+def test_advance_same_status_422(client):
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.post("/api/ideas/%d/advance" % i, json={"to": "idea"})
+    assert r.status_code == 422 and r.json()["detail"] == "该创意已经处于此状态"
+
+
+def test_advance_with_position_single_call(client):
+    """跨列拖拽一次调用同时改状态和位置（SPEC 5.2）。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.post("/api/ideas/%d/advance" % i,
+                    json={"to": "building", "position": 3.5, "note": "开工"},
+                    headers={"X-Panel-Actor": "agent"})
+    assert r.status_code == 200
+    got = r.json()
+    assert got["status"] == "building" and got["position"] == 3.5
+    ev = got["events"][-1]
+    assert ev["kind"] == "status" and ev["from_status"] == "idea"
+    assert ev["to_status"] == "building" and ev["message"] == "开工"
+    assert ev["actor"] == "agent"
+    assert len([e for e in got["events"] if e["kind"] == "status"]) == 1
+
+
+def test_advance_unknown_status_lists_legal_names(client):
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.post("/api/ideas/%d/advance" % i, json={"to": "foobar"})
+    assert r.status_code == 422
+    for k in db.STATUS_KEYS:
+        assert k in r.json()["detail"]
+
+
+def test_advance_without_to_is_422(client):
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    assert client.post("/api/ideas/%d/advance" % i, json={}).status_code == 422
+
+
+def test_advance_writes_done_at_and_clears_it_on_leaving(client):
+    """SPEC 5.1：进 done 写 done_at，离开清空。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    assert client.post("/api/ideas/%d/advance" % i,
+                       json={"to": "done"}).json()["done_at"]
+    assert client.post("/api/ideas/%d/advance" % i,
+                       json={"to": "building"}).json()["done_at"] is None
+
+
+def test_actor_header_rules(client):
+    """SPEC 5.4：非法值忽略记 human，不报错；三个合法值都照记。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    url = "/api/ideas/%d/note" % i
+    assert client.post(url, json={"message": "默认"}).status_code == 200
+    assert client.post(url, json={"message": "人写的"},
+                       headers={"X-Panel-Actor": "robot"}).status_code == 200
+    client.post(url, json={"message": "agent 写的"}, headers={"X-Panel-Actor": "agent"})
+    client.post(url, json={"message": "系统写的"}, headers={"X-Panel-Actor": "system"})
+    evs = [e for e in client.get("/api/ideas/%d" % i).json()["events"] if e["kind"] == "note"]
+    assert [e["actor"] for e in evs] == ["human", "human", "agent", "system"]
+    assert client.get("/api/ideas/%d" % i).json()["events"][0]["actor"] == "human"
+
+
+@pytest.mark.parametrize("payload,detail", [
+    ({"title": None}, "标题不能为空"),
+    ({"title": "   "}, "标题不能为空"),
+    ({"title": 5}, "标题 必须是字符串"),
+    ({"title": "a", "body": None}, "描述 不能为 null，请传空串"),
+    ({"title": "a", "body": 0}, "描述 必须是字符串"),
+    ({"title": "a", "body": ["x"]}, "描述 必须是字符串"),
+    ({"title": "a", "source": None}, "来源 不能为 null，请传空串"),
+    ({"title": "a", "tags": ["x"]}, "标签必须是逗号分隔的字符串"),
+    ({"title": "a", "tags": "  , "}, "标签不能为空"),
+])
+def test_create_rejects_bad_fields_with_spec_wording(payload, detail, client):
+    """app 层不能把 null/非字符串洗成空串——那是不报错的数据损坏。"""
+    r = client.post("/api/ideas", json=payload)
+    assert r.status_code == 422 and r.json()["detail"] == detail
+    assert client.get("/api/ideas").json() == []          # 没落库
+
+
+def test_create_defaults_and_tag_rules(client):
+    """SPEC 第 9 节：未提供 tags -> ","；提供但全空 -> 422。"""
+    ok = client.post("/api/ideas", json={"title": "a"})
+    assert ok.status_code == 201
+    idea = ok.json()
+    assert idea["tags"] == "," and idea["status"] == "idea"
+    assert idea["blocked"] == 0 and idea["blocked_note"] == ""
+    assert idea["done_at"] is None and idea["position"] == 1   # 空列用 COALESCE
+    assert client.post("/api/ideas", json={"title": "b", "tags": "视频, 科普"}).json()["tags"] \
+        == ",视频,科普,"
+    assert client.post("/api/ideas", json={"title": "c", "tags": None}).json()["tags"] == ","
+
+
+def test_create_ignores_client_supplied_position(client):
+    """SPEC 4.2：新建卡片的 position 恒为 COALESCE(MAX,0)+1，不由客户端指定。"""
+    a = client.post("/api/ideas", json={"title": "a"}).json()
+    b = client.post("/api/ideas", json={"title": "b", "position": 99}).json()
+    assert a["position"] == 1 and b["position"] == 2
+
+
+@pytest.mark.parametrize("raw", ["5", "2", "true", "", "-1", "abc", "0.5"])
+def test_blocked_query_param_rejects_anything_but_0_or_1(raw, client):
+    """回归锁：?blocked=5 曾被当成 0，静默返回一整批错的卡片还不报错。"""
+    client.post("/api/ideas", json={"title": "a"})
+    r = client.get("/api/ideas?blocked=%s" % raw)
+    assert r.status_code == 422, (raw, r.status_code, r.text)
+    assert "blocked" in r.json()["detail"]
+
+
+def test_blocked_filter_0_and_1_pick_the_right_cards(client):
+    a = client.post("/api/ideas", json={"title": "卡住的"}).json()["id"]
+    b = client.post("/api/ideas", json={"title": "正常的"}).json()["id"]
+    client.post("/api/ideas/%d/block" % a, json={"reason": "等素材"})
+    assert [x["id"] for x in client.get("/api/ideas?blocked=1").json()] == [a]
+    assert [x["id"] for x in client.get("/api/ideas?blocked=0").json()] == [b]
+    assert len(client.get("/api/ideas").json()) == 2         # 省略 = 全部
+
+
+def test_status_filter_rejects_unknown_value(client):
+    r = client.get("/api/ideas?status=foobar")
+    assert r.status_code == 422 and r.json()["detail"] == "未知状态：foobar"
+
+
+def test_tag_filter_is_whole_label_not_substring(client):
+    """中文查询参数要能穿过 URL 编码；tag 按整标签匹配不是子串。"""
+    a = client.post("/api/ideas", json={"title": "a", "tags": "视频, 科普"}).json()["id"]
+    client.post("/api/ideas", json={"title": "b"})
+    assert [x["id"] for x in client.get("/api/ideas?tag=科普").json()] == [a]
+    assert client.get("/api/ideas?tag=科").json() == []
+
+
+def test_q_words_are_and_across_title_and_body(client):
+    a = client.post("/api/ideas", json={"title": "AI 短片", "body": "先做大纲"}).json()["id"]
+    client.post("/api/ideas", json={"title": "AI 短片", "body": "别的"})
+    assert [x["id"] for x in client.get("/api/ideas?q=AI 短片 先做").json()] == [a]
+    assert client.get("/api/ideas?q=AI 短片 缺词").json() == []
+
+
+def test_query_params_are_text_so_numeric_q_is_a_real_search(client):
+    """?q=5 是搜字面量 "5"，不是类型错误——加"纯数字即 422"会砸掉搜年份。"""
+    client.post("/api/ideas", json={"title": "第 5 集脚本"})
+    client.post("/api/ideas", json={"title": "别的创意"})
+    assert [x["title"] for x in client.get("/api/ideas?q=5").json()] == ["第 5 集脚本"]
+
+
+def test_list_follows_board_column_order(client):
+    """app 层不重排，排序归 store——这里锁住看板列序而不是字典序。"""
+    ids = {k: client.post("/api/ideas", json={"title": k}).json()["id"]
+           for k in db.STATUS_KEYS}
+    for k in reversed(db.STATUS_KEYS):          # 故意乱序推进
+        client.post("/api/ideas/%d/advance" % ids[k], json={"to": k})
+    assert [x["title"] for x in client.get("/api/ideas").json()] == db.STATUS_KEYS
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: c.get("/api/ideas/999"),
+    lambda c: c.patch("/api/ideas/999", json={"title": "x"}),
+    lambda c: c.post("/api/ideas/999/advance", json={"to": "building"}),
+    lambda c: c.post("/api/ideas/999/note", json={"message": "x"}),
+    lambda c: c.post("/api/ideas/999/block", json={"reason": "x"}),
+    lambda c: c.post("/api/ideas/999/unblock"),
+    lambda c: c.delete("/api/ideas/999"),
+])
+def test_missing_idea_is_404_with_human_detail(call, client):
+    r = call(client)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "没有 #999 这条创意"
+
+
+def test_delete_removes_card_and_its_events(client):
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    client.post("/api/ideas/%d/note" % i, json={"message": "x"})
+    r = client.delete("/api/ideas/%d" % i)
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert client.get("/api/ideas/%d" % i).status_code == 404
+    assert client.get("/api/ideas").json() == []
+
+
+def test_block_unblock_over_http(client):
+    """SPEC 5.6：block 重复调用覆盖 note 且每次留痕；unblock 不清空 blocked_note。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    hdr = {"X-Panel-Actor": "agent"}
+    first = client.post("/api/ideas/%d/block" % i, json={"reason": "等素材"}, headers=hdr)
+    assert first.json()["blocked"] == 1 and first.json()["blocked_note"] == "等素材"
+    client.post("/api/ideas/%d/block" % i, json={"reason": "等版权"}, headers=hdr)
+    unblocked = client.post("/api/ideas/%d/unblock" % i, headers=hdr).json()
+    assert unblocked["blocked"] == 0 and unblocked["blocked_note"] == "等版权"
+    got = client.get("/api/ideas/%d" % i).json()
+    assert [e["kind"] for e in got["events"]] == ["created", "blocked", "blocked", "unblocked"]
+    assert all(e["actor"] == "agent" for e in got["events"][1:])
+
+
+def test_block_reason_none_is_422(client):
+    """null 阻塞原因不能被洗成空串，否则等于无声清掉原因。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    r = client.post("/api/ideas/%d/block" % i, json={"reason": None})
+    assert r.status_code == 422 and "不能为 null" in r.json()["detail"]
+    assert client.get("/api/ideas/%d" % i).json()["blocked"] == 0
+
+
+def test_stats_endpoint(client):
+    a = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    client.post("/api/ideas", json={"title": "b"})
+    client.post("/api/ideas/%d/advance" % a, json={"to": "clarifying"})
+    client.post("/api/ideas/%d/block" % a, json={"reason": "卡"})
+    assert client.get("/api/stats").json() == {
+        "counts": {"idea": 1, "clarifying": 1, "clarified": 0,
+                   "building": 0, "done": 0},
+        "blocked": 1}
+
+
+def test_create_app_works_before_web_dir_exists(client):
+    """web/ 要到 Task 5 才建；目录不存在时 StaticFiles 会当场抛错。"""
+    assert client.get("/").status_code == 404
+
+
+def test_web_dir_mount_does_not_shadow_api(tmp_path, monkeypatch):
+    """挂载必须在最后：/api/* 仍走路由，/ 才落到静态目录。"""
+    appm = importlib.import_module("app")
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "c.db"))
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "index.html").write_text("<h1>面板</h1>", encoding="utf-8")
+    monkeypatch.setattr(appm, "WEB_DIR", web)
+    c = TestClient(appm.create_app())
+    assert c.get("/api/health").json() == {"ok": True, "version": "0.1.0"}
+    assert "面板" in c.get("/").text
+    assert c.get("/api/stats").status_code == 200
