@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -19,6 +20,11 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 ACTORS = ("human", "agent", "system")
 BLOCKED_VALUES = ("0", "1")
 
+# 框架层报错的参数名 -> 中文名。与 store._FIELD_LABEL 同一套口径：CLI 的
+# 定位是"输出人话"，不把原始键甩给 agent 看（SPEC 第 9 节）。
+_PARAM_LABEL = {"idea_id": "创意 id", "status": "状态", "tag": "标签",
+                "q": "搜索词", "blocked": "阻塞筛选"}
+
 
 def resolve_actor(request: Request) -> str:
     """SPEC 5.4：只认三个值，非法值当没传记 human，不报错。
@@ -28,6 +34,16 @@ def resolve_actor(request: Request) -> str:
     """
     v = request.headers.get("X-Panel-Actor")
     return v if v in ACTORS else "human"
+
+
+def blank_to_none(v):
+    """空串 = "用户没选"，归一成不过滤，不报 422（SPEC 5.3）。
+
+    `?q=%20%20` 这种纯空白同理：它和空串一样没有表达任何意图。真值
+    （`foobar`、`5`）原样传下去，由各自的守卫判合法性——归一不能顺手把
+    真值的 422 一起吞掉。
+    """
+    return v if v is not None and v.strip() else None
 
 
 def blocked_filter(raw):
@@ -41,8 +57,44 @@ def blocked_filter(raw):
     if raw is None:
         return None
     if raw not in BLOCKED_VALUES:
-        raise store.Invalid("未知取值：%s（blocked 只接受 0 或 1）" % raw)
+        raise store.Invalid("未知取值：%s（阻塞筛选只接受 0 或 1）" % raw)
     return int(raw)
+
+
+def validation_message(exc: RequestValidationError) -> str:
+    """把 pydantic 的错误数组翻成一句人话（SPEC 第 9 节框架层那一行）。
+
+    下游都假定 detail 是字符串：CLI 直接 `r.json()["detail"]` 打印给 agent，
+    前端 `throw new Error(d.detail)`。数组透出去的话 CLI 会打出一串 pydantic
+    字典、前端拿到 "[object Object]"——两种形态混在同一个字段里，下游没法
+    写匹配的逻辑（SPEC 6 要求把「推进到当前状态」翻成「#12 已经在…了」，
+    那种翻译必须建立在 detail 是纯文本之上）。
+
+    文案按 loc 定到具体参数；认不出来的退回一句通用话，**不把 pydantic
+    原文（Input should be ...）甩给人看**。
+    """
+    msgs = []
+    for err in exc.errors():
+        loc = tuple(err.get("loc") or ())
+        kind = err.get("type") or ""
+        name = _PARAM_LABEL.get(loc[1], loc[1]) if len(loc) > 1 else ""
+        if loc[:1] == ("body",):
+            # loc 可能是 ("body", 3)——json_invalid 时带字符下标
+            if kind == "missing":
+                msg = "缺少请求体"
+            elif kind == "json_invalid":
+                msg = "请求体不是合法的 JSON"
+            else:
+                msg = "请求体必须是 JSON 对象"
+        elif loc[:1] == ("path",):
+            msg = "%s 必须是整数" % (name or "路径参数")
+        elif loc[:1] == ("query",):
+            msg = "%s 不合法" % (name or "查询参数")
+        else:
+            msg = "请求参数不合法"
+        if msg not in msgs:
+            msgs.append(msg)
+    return "；".join(msgs) or "请求参数不合法"
 
 
 def create_app():
@@ -57,6 +109,13 @@ def create_app():
     async def _invalid(request, exc):
         return JSONResponse(status_code=422, content={"detail": exc.detail})
 
+    # 框架层（pydantic）错误与上面两个处理器并排：detail 全局只有一种形态，
+    # 就是字符串。少了它，同一个 {"detail": ...} 字段下会同时存在 str 和数组。
+    @app.exception_handler(RequestValidationError)
+    async def _framework_error(request, exc):
+        return JSONResponse(status_code=422,
+                            content={"detail": validation_message(exc)})
+
     @app.get("/api/health")
     def health():
         return {"ok": True, "version": VERSION}
@@ -68,8 +127,12 @@ def create_app():
     def ideas(status: str | None = None, tag: str | None = None,
               q: str | None = None, blocked: str | None = None):
         # 四个筛选正交取交集（SPEC 5.3）；排序由 store 负责，这里不重排。
-        return store.list_ideas(status=status, tag=tag, q=q,
-                                blocked=blocked_filter(blocked))
+        # 空串先归一成 None——前端按"params 一律拼进 URL"写时，未选中的
+        # 筛选会拼出 `?status=`，那是"没选"不是"选错"，不能报 422。
+        return store.list_ideas(status=blank_to_none(status),
+                                tag=blank_to_none(tag),
+                                q=blank_to_none(q),
+                                blocked=blocked_filter(blank_to_none(blocked)))
 
     @app.post("/api/ideas", status_code=201)
     def create(body: dict, request: Request):

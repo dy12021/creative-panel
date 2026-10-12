@@ -903,13 +903,13 @@ def test_create_ignores_client_supplied_position(client):
     assert a["position"] == 1 and b["position"] == 2
 
 
-@pytest.mark.parametrize("raw", ["5", "2", "true", "", "-1", "abc", "0.5"])
+@pytest.mark.parametrize("raw", ["5", "2", "true", "-1", "abc", "0.5"])
 def test_blocked_query_param_rejects_anything_but_0_or_1(raw, client):
     """回归锁：?blocked=5 曾被当成 0，静默返回一整批错的卡片还不报错。"""
     client.post("/api/ideas", json={"title": "a"})
     r = client.get("/api/ideas?blocked=%s" % raw)
     assert r.status_code == 422, (raw, r.status_code, r.text)
-    assert "blocked" in r.json()["detail"]
+    assert "阻塞筛选" in r.json()["detail"]        # 中文字段名，不打原始键
 
 
 def test_blocked_filter_0_and_1_pick_the_right_cards(client):
@@ -1031,3 +1031,137 @@ def test_web_dir_mount_does_not_shadow_api(tmp_path, monkeypatch):
     assert c.get("/api/health").json() == {"ok": True, "version": "0.1.0"}
     assert "面板" in c.get("/").text
     assert c.get("/api/stats").status_code == 200
+
+
+# --- 修复轮 1：detail 契约统一 + 筛选参数空串归一 ---------------------------
+# 上一轮两种 detail 形态混在同一个 {"detail": ...} 字段下：store 的 Invalid 是
+# 字符串，pydantic 的框架层错误是数组。CLI 直接 r.json()["detail"] 打印、
+# 前端 throw new Error(d.detail)，两边都假定它是字符串——数组透出去，CLI 打出一
+# 串 python 字典、前端拿到 "[object Object]"，SPEC 6 要求的"翻译成
+# 「#12 已经在『正在明确』了」那种匹配根本写不出来。
+
+
+@pytest.mark.parametrize("method,url,payload,fragment", [
+    ("GET", "/api/ideas/abc", None, "创意 id"),        # 路径参数非整数
+    ("POST", "/api/ideas", ["title"], "JSON 对象"),
+    ("PATCH", "/api/ideas/1", ["title"], "JSON 对象"),
+    ("POST", "/api/ideas/1/advance", ["to"], "JSON 对象"),
+    ("POST", "/api/ideas/1/note", "x", "JSON 对象"),
+    ("POST", "/api/ideas/1/block", 5, "JSON 对象"),
+    ("POST", "/api/ideas/1/block", True, "JSON 对象"),
+])
+def test_framework_errors_return_a_human_detail_string(method, url, payload, fragment,
+                                                       client):
+    """SPEC 第 9 节：框架层错误也得是人话字符串，不是 pydantic 数组。
+
+    光断言 422 是恒真的——两种形态都是 422。必须同时断言类型和文案，
+    并且明确断言 pydantic 原文没有漏出来。
+    """
+    r = client.request(method, url, json=payload)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert isinstance(detail, str), (url, payload, type(detail), detail)
+    assert fragment in detail
+    assert "Input should be" not in detail         # 别把 pydantic 原文甩给人看
+
+
+def test_path_id_error_names_the_parameter(client):
+    r = client.get("/api/ideas/abc")
+    assert r.status_code == 422
+    assert r.json()["detail"] == "创意 id 必须是整数"
+
+
+def test_missing_body_detail_is_a_human_string(client):
+    r = client.post("/api/ideas")
+    assert r.status_code == 422
+    assert r.json()["detail"] == "缺少请求体"
+
+
+def test_bad_json_detail_is_a_human_string(client):
+    r = client.request("POST", "/api/ideas", content=b"{oops",
+                       headers={"content-type": "application/json"})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "请求体不是合法的 JSON"
+
+
+def test_literal_null_body_detail_is_a_human_string(client):
+    r = client.request("POST", "/api/ideas", content=b"null",
+                       headers={"content-type": "application/json"})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "缺少请求体"
+
+
+def test_every_endpoint_error_detail_is_a_string(client):
+    """契约扫描：detail 全局只有一种形态。逐条走一遍 4xx 路径。"""
+    i = client.post("/api/ideas", json={"title": "a"}).json()["id"]
+    responses = [client.get("/api/health"),
+                 client.get("/api/ideas"),
+                 client.get("/api/ideas/%d" % i),
+                 client.get("/api/ideas/999"),
+                 client.get("/api/ideas/abc"),
+                 client.get("/api/nope"),
+                 client.post("/api/ideas", json={"title": "   "}),
+                 client.post("/api/ideas", json=["x"]),
+                 client.post("/api/ideas", json={"title": "b", "tags": " , "}),
+                 client.patch("/api/ideas/%d" % i, json={}),
+                 client.patch("/api/ideas/%d" % i, json={"status": "done"}),
+                 client.patch("/api/ideas/%d" % i, json={"title": None}),
+                 client.post("/api/ideas/%d/advance" % i, json={"to": "idea"}),
+                 client.post("/api/ideas/%d/advance" % i, json={"to": "foobar"}),
+                 client.get("/api/ideas?status=foobar"),
+                 client.get("/api/ideas?blocked=5"),
+                 client.delete("/api/ideas/999")]
+    # 只查错误响应：200 本来就没有 detail 字段。带上成功响应是为了顺带确认
+    # 扫描逻辑本身没写错。
+    errors = [r for r in responses if r.status_code >= 400]
+    assert len(errors) >= 12, [r.status_code for r in responses]   # 防止全 200 变恒真
+    for r in errors:
+        detail = r.json().get("detail")
+        assert isinstance(detail, str) and detail, (str(r.request.url),
+                                                    r.status_code, detail)
+
+
+@pytest.mark.parametrize("param", ["status", "tag", "q", "blocked"])
+def test_blank_filter_means_no_filter(param, client):
+    """SPEC 5.3：空串表达"没选"，归一成不过滤，不报 422。"""
+    client.post("/api/ideas", json={"title": "有标签", "tags": "视频"})
+    client.post("/api/ideas", json={"title": "无标签"})
+    r = client.get("/api/ideas?%s=" % param)
+    assert r.status_code == 200
+    assert len(r.json()) == 2                     # 与省略该参数完全一致
+
+
+@pytest.mark.parametrize("param", ["status", "tag", "q", "blocked"])
+def test_whitespace_filter_means_no_filter(param, client):
+    """纯空白和空串一样没有表达任何意图，一起归一。"""
+    client.post("/api/ideas", json={"title": "有标签", "tags": "视频"})
+    client.post("/api/ideas", json={"title": "无标签"})
+    r = client.get("/api/ideas?%s=%%20%%20" % param)
+    assert r.status_code == 200
+    assert len(r.json()) == 2
+
+
+@pytest.mark.parametrize("param,bad", [("status", "foobar"), ("blocked", "5")])
+def test_blank_does_not_mask_an_illegal_value(param, bad, client):
+    """归一只作用于空串：?status=&blocked=5 里的真值仍须 422。"""
+    client.post("/api/ideas", json={"title": "a"})
+    r = client.get("/api/ideas?%s=&%s=%s" % (param, "blocked" if param == "status"
+                                              else "status", bad))
+    assert r.status_code == 422
+    assert isinstance(r.json()["detail"], str)
+
+
+def test_blank_filter_does_not_widen_the_other_filters(client):
+    """?q= 不能把 ?status=building 变成不过滤——归一是逐参数的。"""
+    client.post("/api/ideas", json={"title": "甲"})
+    b = client.post("/api/ideas", json={"title": "乙"}).json()["id"]
+    client.post("/api/ideas/%d/advance" % b, json={"to": "building"})
+    assert [x["title"] for x in client.get("/api/ideas?q=&status=building").json()] == ["乙"]
+    assert len(client.get("/api/ideas?q=").json()) == 2
+
+
+def test_blocked_error_uses_chinese_field_name(client):
+    """SPEC 第 9 节：文案用中文字段名，不打原始键。"""
+    r = client.get("/api/ideas?blocked=5")
+    assert r.status_code == 422
+    assert r.json()["detail"] == "未知取值：5（阻塞筛选只接受 0 或 1）"
