@@ -1575,6 +1575,28 @@ def test_cli_null_optional_text_is_shown_as_empty(
     assert "Traceback" not in r.stdout + r.stderr
 
 
+@pytest.mark.parametrize("field", ["from_status", "to_status", "message"])
+def test_cli_timeline_never_prints_python_none(stub_server, monkeypatch, field):
+    """时间线里可空字段为 null 时，不能把 Python 的 None 打进输出。
+
+    这三个字段在 schema 里都可能是 null（新建的创意没有来源状态），
+    但它们**同属一条时间线记录**，策略必须一致：message 归一成空串，
+    from/to 也得归一，否则同一屏里一处是空、一处是「None」。
+    本项目 store 恒写非 null，所以这条是拿桩喂外来响应才走得到——
+    恰恰因为走不到，才必须用测试钉住，不能靠「跑一遍没看见」。
+    """
+    event = {"actor": "agent", "kind": "status",
+             "created_at": "2026-10-12T15:18:32.1", "message": "推进",
+             "from_status": "idea", "to_status": "building"}
+    event[field] = None
+    monkeypatch.setenv("PANEL_URL", stub_server(
+        200, "application/json", _idea_json(events=[event])))
+    r = _cli("show", "1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "None" not in r.stdout, "把 Python 的 None 打进给人看的输出了"
+    assert "Traceback" not in r.stdout + r.stderr
+
+
 def test_cli_advance_status_field_type_is_checked(stub_server, monkeypatch):
     """推进**成功**那条路上的 status：CLI 自己打回的不合格键一样要拦。
 

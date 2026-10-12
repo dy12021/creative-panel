@@ -261,8 +261,10 @@ def _timeline(events):
         when = "%s %s" % (ts[5:10], ts[11:16])
         msg = e["message"] or ""
         if e["kind"] == "status":
-            print("  %s [%s] %s → %s %s" % (when, who, label(e["from_status"]),
-                                             label(e["to_status"]), msg))
+            # from/to 和 message 一样可能是 null（新建的创意没有来源状态），
+            # 同样归一成空串。别把 Python 的 None 打进给人看的输出。
+            print("  %s [%s] %s → %s %s" % (when, who, label(e["from_status"] or ""),
+                                             label(e["to_status"] or ""), msg))
         else:
             print("  %s [%s] %s %s" % (when, who, KIND.get(e["kind"], e["kind"]),
                                        msg))
