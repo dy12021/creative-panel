@@ -1,11 +1,17 @@
 """创意面板后端回归测试。设计依据 SPEC 第 11 节。"""
 import importlib
 import os
+import socket
 import sqlite3
+import subprocess
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient  # noqa: E402  仅 HTTP 层那几节用得到
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "server"))
@@ -1165,3 +1171,209 @@ def test_blocked_error_uses_chinese_field_name(client):
     r = client.get("/api/ideas?blocked=5")
     assert r.status_code == 422
     assert r.json()["detail"] == "未知取值：5（阻塞筛选只接受 0 或 1）"
+
+
+# --- Task 4：panel.py CLI（真起 uvicorn，子进程走真实 HTTP）--------------------
+# CLI 的失败方式（一句人话 + 退出码 1、不打 Python 栈）是产品契约的一部分，
+# 只能端到端验：在本进程里起真 uvicorn，再用子进程真调 skill/panel.py。
+# 不 pop/reimport——app/db/store 每次调用都重读 PANEL_DB，模块缓存不是问题。
+
+PANEL_PY = Path(__file__).parent / "skill" / "panel.py"
+
+
+@pytest.fixture()
+def live_server(tmp_path, monkeypatch):
+    """真起 uvicorn，随机空闲端口，CLI 走真实 HTTP。
+
+    端口先 bind(0) 拿到再 close 交给 uvicorn：存在 TOCTOU 窗口，但本机单进程
+    测试下可接受（SPEC 11）；固定端口会和正在运行的面板抢。
+    """
+    sock = socket.socket()
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "live.db"))
+    monkeypatch.setenv("PANEL_URL", "http://127.0.0.1:%d" % port)
+    appm = importlib.import_module("app")
+    cfg = uvicorn.Config(appm.create_app(), host="127.0.0.1", port=port,
+                         log_level="critical")
+    srv = uvicorn.Server(cfg)
+    t = threading.Thread(target=srv.run, daemon=True)
+    t.start()
+    for _ in range(100):
+        if srv.started:
+            break
+        time.sleep(0.05)
+    assert srv.started, "uvicorn 没能起来"
+    yield "http://127.0.0.1:%d" % port
+    srv.should_exit = True
+    t.join(timeout=5)
+
+
+@pytest.fixture()
+def stub_server():
+    """假服务端：按给定的 (status, content-type, body) 应答任意 GET。
+
+    存在的理由是**活的服务端造不出这些响应**：未捕获异常的 500 是纯文本而不是
+    {"detail": ...}（不在 detail 契约内），框架层处理器也管不到它。
+    """
+    started = []
+
+    def _start(status, ctype, body):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        started.append(httpd)
+        return "http://127.0.0.1:%d" % httpd.server_address[1]
+
+    yield _start
+    for httpd in started:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _cli(*args):
+    """跑真 CLI 子进程。
+
+    env 显式透传：PANEL_URL 必须进子进程（服务端在父进程的线程里，地址只能靠
+    环境变量过去）。靠隐式继承也能跑通，但这条链路是这里要断言的东西之一。
+    """
+    return subprocess.run(
+        [sys.executable, str(PANEL_PY), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ})
+
+
+def _new_id(title):
+    """建一张卡并回传 id——CLI 只打人话，id 得从输出里抠。"""
+    r = _cli("new", title)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout.split("#")[1].split("「")[0]
+
+
+def test_cli_full_cycle(live_server):
+    """9 个子命令全走一遍：少一个就有一条永远没人走过的路。
+
+    断言同时钉住两件事：输出是人话，以及子进程的 stdout 是 UTF-8——
+    Windows 上 stdout 默认跟 locale 走 cp936，`✔` 在里面编不出来。
+    """
+    import re
+    r = _cli("new", "AI 发展史", "--tags", "视频,科普")
+    assert r.returncode == 0 and "✔ 已创建 #" in r.stdout
+    iid = r.stdout.split("#")[1].split("「")[0]
+    r = _cli("advance", iid, "正在明确", "--note", "开始聊需求")
+    assert r.returncode == 0 and "正在明确" in r.stdout
+    r = _cli("advance", iid, "clarifying")
+    # SPEC 6 点名要翻的：推到当前状态得说成"#1 已经在『正在明确』了"，
+    # 而不是把"该创意已经处于此状态"原样甩出去——后者没说是哪个状态，
+    # 对 agent 没用（4）。
+    assert r.returncode == 1 and "#%s 已经在『正在明确』了" % iid in r.stdout
+    r = _cli("note", iid, "脚本已定稿")
+    assert r.returncode == 0 and "已加备注" in r.stdout
+    r = _cli("list", "--status", "clarifying")
+    assert "AI 发展史" in r.stdout
+    r = _cli("stats")
+    assert "正在明确" in r.stdout and "阻塞中" in r.stdout
+    r = _cli("show", iid)
+    assert "开始聊需求" in r.stdout and "脚本已定稿" in r.stdout
+    # 时间线也是人话：中文 kind、"10-12 15:20" 而不是 ISO 串里那个 T。
+    # 少了这条，上面两行只验了 message 透传，改坏格式照样绿。
+    assert "备注 脚本已定稿" in r.stdout
+    assert "创建 AI 发展史" in r.stdout
+    assert re.search(r"^\s*\d\d-\d\d \d\d:\d\d \[agent\] 仅有创意 → 正在明确"
+                     r" 开始聊需求$", r.stdout, re.M)
+    r = _cli("block", iid, "等授权")
+    assert "已阻塞" in r.stdout
+    r = _cli("unblock", iid)
+    assert "已解除阻塞" in r.stdout
+    r = _cli("delete", iid)
+    assert r.returncode == 0
+    assert _cli("show", iid).returncode == 1
+
+
+def test_cli_missing_id_is_human(live_server):
+    r = _cli("show", "999")
+    assert r.returncode == 1 and "没有 #999" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_cli_bad_id_type_is_passed_through(live_server):
+    """手输 `advance abc building` 是日常操作。
+
+    要的是后端那句「创意 id 必须是整数」，不是 argparse 甩一屏 usage。
+    """
+    r = _cli("advance", "abc", "building")
+    assert r.returncode == 1 and "创意 id 必须是整数" in r.stdout
+    assert "usage:" not in r.stdout
+
+
+def test_cli_unknown_status_is_left_to_the_server(live_server):
+    """CLI 侧不维护状态表：原样发出去，让服务端回 422 + 合法值列表。
+
+    自己那份表会和 db.STATUS_KEYS 分叉，面板改列序时它还按旧表翻译。
+    """
+    iid = _new_id("待推进")
+    r = _cli("advance", iid, "瞎写的状态")
+    assert r.returncode == 1 and "未知状态" in r.stdout
+    for k in db.STATUS_KEYS:
+        assert k in r.stdout
+
+
+def test_cli_status_argument_takes_chinese_and_key(live_server):
+    """SPEC 6：advance / list 的状态参数中英文都合法。"""
+    iid = _new_id("中文状态卡")
+    assert _cli("advance", iid, "正在明确").returncode == 0
+    assert "中文状态卡" in _cli("list", "--status", "正在明确").stdout
+    assert "中文状态卡" in _cli("list", "--status", "clarifying").stdout
+
+
+def test_cli_output_survives_characters_the_console_cannot_encode(live_server):
+    """标题里的 emoji 在 cp936 控制台上编不出来。
+
+    宁可被替换成 ?，也不能因为编码崩掉——崩掉就意味着 SPEC 第 9 节禁止的
+    Python 栈被甩给 agent。
+    """
+    r = _cli("new", "🎬 分镜表")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "🎬" in r.stdout
+
+
+def test_cli_server_down(monkeypatch):
+    monkeypatch.setenv("PANEL_URL", "http://127.0.0.1:1")
+    r = _cli("stats")
+    assert r.returncode == 1 and "面板未启动" in r.stdout
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("status,ctype,body,want,unwanted", [
+    # 真·500：未捕获异常时服务端返纯文本，不是 {"detail": ...}
+    (500, "text/plain; charset=utf-8", b"Internal Server Error",
+     "Internal Server Error", "Traceback"),
+    # detail 不是字符串（契约外）：也不许把 pydantic 原文甩给 agent
+    (500, "application/json", b'{"detail": [{"loc": ["body", "to"]}]}',
+     "500", "loc"),
+    # 网关/代理错误页：HTML 对 agent 没意义
+    (500, "text/html; charset=utf-8", b"<html><body>500</body></html>",
+     "500", "<html>"),
+    # 200 但不是 JSON：PANEL_URL 指到了网页
+    (200, "text/html; charset=utf-8", b"<html>ok</html>",
+     "不是 JSON", "<html>"),
+])
+def test_cli_unreadable_response_is_still_one_human_line(
+        stub_server, monkeypatch, status, ctype, body, want, unwanted):
+    """响应体读不出来时也必须是一句人话 + 退出码 1，不能是解析异常。"""
+    monkeypatch.setenv("PANEL_URL", stub_server(status, ctype, body))
+    r = _cli("stats")
+    assert r.returncode == 1
+    assert want in r.stdout
+    assert unwanted not in r.stdout + r.stderr
