@@ -54,21 +54,31 @@
 
 以下几条是容易踩坑的地方，实现时必须照做：
 
-**`tags` 首尾补逗号。** 存 `",视频,科普,"` 而不是 `"视频,科普"`，这样精确匹配只需一条 `LIKE '%,'||?||',%'`，不用写四路 `OR`。**标签本身禁止含逗号**——CLI 和 API 都拒绝含逗号的标签，这是最简单且不会产生歧义的规则。
+**`tags` 首尾补逗号 + 逐个 strip。** 存 `",视频,科普,"` 而不是 `"视频,科普"`，这样精确匹配只需一条 `LIKE '%,'||?||',%'`，不用写四路 `OR`。
 
-**`position` 的作用域是"列内"。** 即 `(status, position)` 才是完整的排序键，不是全局唯一。跨列拖拽后 `position` 必须在目标列内重新计算，不沿用原值。所有排序一律 `ORDER BY position, id`——`id` 作为 tie-breaker 防止浮点相等时顺序抖动。中点插入法在长期反复拖拽后会耗尽浮点精度，届时执行一次全量重排（按当前列顺序重写 `position` 为 1,2,3…）。
+规范化流程（服务端在写入时统一处理，存进去的一定是规范形式）：
 
-**`updated_at` 由 SQLite 触发器维护**，不靠每个写路径手写，避免漏改：
+1. 按逗号切分
+2. 每个标签 `strip()` 去掉首尾空白
+3. **丢弃空标签**
+4. 去重后重新拼接，首尾各补一个逗号
 
-```sql
-CREATE TRIGGER trg_ideas_touch AFTER UPDATE ON ideas
-BEGIN
-  UPDATE ideas SET updated_at = strftime('%Y-%m-%dT%H:%M:%S','now','localtime')
-  WHERE id = NEW.id;
-END;
-```
+`"视频, 科普, "` → `",视频,科普,"`。若规范化后为空串则存 `","`（表示"无标签"）。
+**标签本身禁止含逗号**——API 和 CLI 都拒绝，这是最简单且不会产生歧义的规则。
 
-**`PRAGMA journal_mode=WAL`** 在每次建连时设置。agent 和浏览器可能同时写，WAL 避免互相阻塞。
+**`position` 的作用域是"列内"。** 即 `(status, position)` 才是完整的排序键，不是全局唯一。跨列拖拽后 `position` 必须在目标列内重新计算，不沿用原值。所有排序一律 `ORDER BY position, id`——`id` 作为 tie-breaker 防止浮点相等时顺序抖动。
+
+新建卡片的 `position = COALESCE(该列 MAX(position), 0) + 1`。**空列没有最大值，直接写 `MAX(position) + 1` 会得到 NULL，撞上 `NOT NULL` 约束。**
+
+中点插入法在长期反复拖拽后会耗尽浮点精度。**重排触发条件**：当插入位置与相邻卡片的 `position` 差值小于 `1e-10` 时，按当前列的 `ORDER BY position, id` 顺序把该列 `position` 重写为 `1, 2, 3, …`。
+
+**建连时必设的 PRAGMA（两类性质不同，别混为一谈）**：
+
+- `PRAGMA foreign_keys=ON` —— **每连接生效**，SQLite 默认关闭。不设这一句，5.7 的级联删除根本不发生。
+- `PRAGMA recursive_triggers=OFF` —— **每连接生效**，SQLite 默认关闭。4.3 的 `updated_at` 触发器在同一张表上再 `UPDATE`，靠这一条保证不自递归。
+- `PRAGMA journal_mode=WAL` —— **数据库文件属性，首次建库设一次即可，之后自动持久化**。每次建连重复设置也幂等无妨，但它和上面两条不是一回事。用于避免 agent 与浏览器同时写时互相阻塞。
+
+**`PANEL_DB` 环境变量**：`db.py` 从这里读数据库路径，**缺省为 `<项目根>/data/panel.db`**。测试用它指向临时文件。与 `PANEL_URL`（CLI 读，缺省 `http://127.0.0.1:8472`）对称。
 
 ### 4.3 表结构
 
@@ -100,9 +110,22 @@ CREATE TABLE events (
   created_at  TEXT NOT NULL
 );
 CREATE INDEX idx_events_idea ON events(idea_id, id);
+
+CREATE TRIGGER trg_ideas_touch AFTER UPDATE ON ideas
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+  UPDATE ideas SET updated_at = strftime('%Y-%m-%dT%H:%M:%S','now','localtime')
+  WHERE id = NEW.id;
+END;
 ```
 
-级联删除依赖两件事同时成立，缺一不可：上面的 `REFERENCES ... ON DELETE CASCADE`，以及 `db.py` 每次建连时执行 `PRAGMA foreign_keys=ON`（SQLite 默认关闭外键，不开这一句级联不会发生）。
+**`updated_at` 由触发器维护，不靠每个写路径手写**，避免六个写端点漏一个就漂。
+
+触发器的 `WHEN NEW.updated_at = OLD.updated_at` 是**第二道保险**：它只在本次更新没有主动改动 `updated_at` 时才写，于是内层 `UPDATE` 再次触发时 `WHEN` 为假，递归到此终止。这样即使有人把 `recursive_triggers` 打开也不会无限递归——4.2 里列该 PRAGMA 是第一道保险，这里是第二道。
+
+时间戳用 `strftime('%Y-%m-%dT%H:%M:%S','now','localtime')`，产出如 `2026-10-12T14:30:00`，**不带时区偏移**。单机自用没问题；将来若做跨设备或跨时区，会需要改成带偏移的格式（见第 12 节）。
+
+级联删除依赖两件事同时成立，缺一不可：上面的 `REFERENCES ... ON DELETE CASCADE`，以及 `db.py` 每次建连时执行 `PRAGMA foreign_keys=ON`。
 
 `source` 的语义：**这条创意是从哪儿来的**，例如 `对话产生` / `随手记` / `从 AI 发展史项目带过来`。它是自由文本，不做枚举约束。
 
@@ -163,7 +186,7 @@ GET    /api/stats                         各态计数 + 阻塞数
 - **跨列拖拽** → `POST /advance {to, position}`
 - **列内拖拽** → `PATCH {position}`
 
-新建卡片 `position = 该列当前最大值 + 1`。
+新建卡片的 `position` 取值、以及浮点精度耗尽时的重排阈值，见 4.2。
 
 ### 5.3 筛选语义
 
@@ -187,9 +210,16 @@ GET    /api/stats                         各态计数 + 阻塞数
 
 一次 PATCH 无论改几个字段，**只写一条 `edited` event**，`message` 记录被修改的字段名列表（如 `修改了：tags, source`），不存 diff——diff 在这里没有阅读价值，知道"哪些字段被碰过"就够了。
 
-### 5.6 unblock 的行为
+边界情况：
 
-`unblock` **保留** `blocked_note` 不清空。历史原因以 `events` 为准，卡片上的 `blocked_note` 只是当前快照。**前端只在 `blocked == 1` 时渲染 `blocked_note`**，避免出现"没卡住却挂着旧原因"的错觉。
+- `PATCH {}`（空对象）→ **422**「没有可更新的字段」，与"白名单外字段"同样 fail fast。
+- 字段值与当前值**完全相同** → **仍然 200 且仍写一条 `edited` event**。语义是"有人碰过这条记录"，且实现上无需额外做差异比较。
+
+### 5.6 block / unblock 的行为
+
+**`block` 允许重复调用**，覆盖 `blocked_note`，**每次都写一条 `blocked` event**——因为 block 的核心是"记录原因"，原因变了就值得留痕。它与 advance 的语义不同：advance 是状态跃迁，到当前状态是噪声；block 是追加事实，重复即有新信息。
+
+**`unblock` 保留** `blocked_note` 不清空。历史原因以 `events` 为准，卡片上的 `blocked_note` 只是当前快照。**前端只在 `blocked == 1` 时渲染 `blocked_note`**，避免出现"没卡住却挂着旧原因"的错觉。
 
 再次 `block` 会覆盖 `blocked_note`。
 
@@ -291,19 +321,25 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 
 ### 8.3 签名元素：流转轨
 
-每张卡片左缘一条竖直轨，分 5 段对应 5 态。段填充规则——**以当前态索引 `i`（`idea`=0 … `done`=4）为准**：
+流转轨是卡片左缘一条**竖直**的窄条，**自上而下 5 格**，一格对应一个状态。渲染规则——**以当前态索引 `i`（`idea`=0 … `done`=4）为准**：
 
 - 索引 `< i` → 实心（已过）
 - 索引 `== i` → 发光圆点（当前）
 - 索引 `> i` → 虚线（未到）
 
-**跳跃推进时，被跳过的态算"已过"，一律实心。** 例如 `idea` 直接跳到 `building`（`i=3`），前 3 段全实心，第 4 段发光，第 5 段虚线。这符合线性有序语义，实现时不要按"走过的路径"画，要按索引比较画。
+一张 `building` 卡片（`i=3`）的轨，自上而下是：
 
 ```
-▌ AI 发展史短片系列
-▌ ┃━━━━━━━◉┄┄┄       ← building：3 段实心，第 4 段发光，第 5 段虚线
-▌ 视频 · 科普
+   │█│  idea        已过   实心，中性灰
+   │█│  clarifying  已过   实心，sky
+   │█│  clarified   已过   实心，violet
+   ├◉┤  building    当前   发光圆点，amber   ← 发光
+   └┊┘  done        未到   虚线
 ```
+
+已过的格子用**它自己那一态的颜色**，而不是当前态的颜色——这样整条轨本身就是一条状态光谱。
+
+**跳跃推进时，被跳过的态算"已过"，一律实心。** 例如 `idea` 直接跳到 `building`，上图中前 3 格全实心、第 4 格发光、第 5 格虚线。这符合线性有序语义。实现时按**索引比较**画，不要按"走过的路径"画。
 
 **阻塞时不要把整条轨涂红。** 整轨变红会丢掉"走到哪一步"这个信息，正是流转轨存在的意义。正确做法：只把**当前态圆点**转为红色，并给卡片加一道红色描边。进度可读性必须保留。
 
@@ -327,8 +363,8 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 
 ### 8.5 交互
 
-- **跨列拖拽** = 一次 `POST /advance {to, position}`，立刻写 `events`（actor=human）
-- **列内拖拽** = `PATCH {position}`
+- **drop 时先比较源列与目标列**：相同 → `PATCH {position}`；不同 → `POST /advance {to, position}`。**不要在落回原列时发 advance**，否则会撞上 5.1 的 422，用户看到一个莫名其妙的错误
+- 跨列拖拽一次 `advance` 完成，立刻写 `events`（actor=human）
 - 点卡片 = 右侧抽屉：完整描述、标签编辑、阻塞按钮、**完整时间线**
 - 抽屉里的"推进"控件 = 目标状态选择器 + **一个可填可不填的备注框**。人手操作同样要能补一句，否则 human 路径写出的 events 全是空 message，时间线会很难读
 - 拖动时显示落点占位块 `#0000001a`（沿用 SnowLuma 的做法）
@@ -358,7 +394,9 @@ skill 只管**怎么操作面板**。具体干活（出图、做视频、写稿�
 | advance 到当前状态 | 422；「该创意已经处于此状态」 |
 | `status` 筛选值非法 | 422；「未知状态：foobar」 |
 | PATCH 含白名单外的字段 | 422；指出是哪个字段，并提示状态须走 advance |
+| PATCH 空对象 | 422；「没有可更新的字段」 |
 | 标签含逗号 | 422；「标签不能包含逗号」 |
+| 标签规范化后为空 | 422；「标签不能为空」 |
 | id 不存在 | 404；CLI 打印「没有 #99 这条创意」 |
 
 CLI 捕获 HTTP 错误后把后端的 `detail` 字段原样翻译成人话，不打印堆栈。
@@ -396,21 +434,23 @@ skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负
 
 `test_panel.py`，依赖 `pytest` + `httpx`。
 
-**运行方式**：用 `tmp_path` fixture 建临时 db 文件，通过 `PANEL_DB` 环境变量让 `db.py` 指向它；在同一 fixture 里用 `uvicorn.Server` 起一个后台线程监听**随机空闲端口**，测试全部通过真实 HTTP 访问。fixture 结束时关线程、删临时文件。**绝不使用 `data/panel.db`**，也不占用固定端口 8472，因此可与正在运行的面板并存、可重复运行。
+**运行方式**：用 `tmp_path` fixture 建临时 db 文件，通过环境变量 `PANEL_DB` 让 `db.py` 指向它；在同一 fixture 里用 `uvicorn.Server` 起一个后台线程监听**随机空闲端口**，测试全部通过真实 HTTP 访问。端口用 `socket.bind(('', 0))` 取得后立即关闭再交给 uvicorn——存在 TOCTOU 窗口，但本机单进程测试下可接受，**不要改用固定端口**，否则无法与正在运行的面板并存。fixture 结束时关线程、删临时文件。**绝不使用 `data/panel.db`**。
 
 覆盖：
 
 1. 建创意 → 5 态全链路推进 → `events` 条数与顺序正确
 2. `PATCH` 传 `status` 返回 422
-3. `PATCH` 传白名单外字段返回 422
+3. `PATCH` 传白名单外字段返回 422；`PATCH {}` 返回 422；值未变仍写 `edited`
 4. advance 到当前状态返回 422
-5. 阻塞 / 解除阻塞各写一条 event，且 `unblock` 后 `blocked_note` 保留
+5. 阻塞 / 解除阻塞各写一条 event；重复 `block` 覆盖 note 且再写一条；`unblock` 后 `blocked_note` 保留
 6. 四维筛选：`status` / `tag` / `q` / `blocked`，含非法 `status` 返回 422
 7. 删除级联删除 `events`（这条专门验证 `PRAGMA foreign_keys=ON` 真的生效）
 8. advance 到 `done` 写 `done_at`，离开 `done` 清空
 9. `PATCH` 多字段只写一条 `edited` event
-10. tags 首尾逗号约定：`tag=科普` 命中、`tag=科` 不命中
+10. tags 规范化：`"视频, 科普, "` → `",视频,科普,"`；`tag=科普` 命中、`tag=科` 不命中；全空白标签被拒
 11. 排序稳定性：`position` 相同时按 `id` 升序
+12. 空列中新建卡片 `position` 为 1（验 `COALESCE`，不撞 NOT NULL）
+13. 任意一条 UPDATE 都刷新 `updated_at`，且触发器不自递归
 
 目标：改后端后一条命令能确认没回归。
 
@@ -430,6 +470,8 @@ skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负
 **将来很可能会回头做的**（现在明确不做，但记在这里免得重新讨论）：
 
 - `GET /api/events?since=` 全局事件流。若以后想做"最近发生了什么"这类跨创意的视图，现在只能逐个 idea 取 events 拼装
+- 列表接口的分页与排序：`?limit=` / `?offset=` / `?sort=`。现在一次拉全部，本机量级（几十条）没压力，但接口形态早晚要动
+- 时间戳改为带时区偏移的格式。当前格式（4.3）不带偏移，跨设备或跨时区场景会出问题
 - 卡片附件缩略图（要动存储模型，是另一个 spec 的事）
 - 多设备同步（当前假设只有这一台机器）
 
