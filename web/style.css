@@ -102,22 +102,29 @@ button { cursor: pointer; }
 /* Task 7 拖拽时给目标列加的提示态 */
 .col.drop-hint { outline: 2px dashed var(--fg-dim); outline-offset: -2px; }
 
-/* ------------------------------------------------------------- 卡片
+/* ------------------------------------------------------------- 卡片与流转轨
  *
- * 8.3 的签名元素（卡片左缘 5 段竖直流转轨）由 Task 6 接入 .rail，
- * 本任务不画。这里只把卡片本体与元信息的样式铺好。 */
+ * 8.3 的签名元素：卡片左缘一条竖直窄条，自上而下 5 格。
+ * 卡片因此改成横向 flex（左轨 + 右内容列）——纵向 flex 里轨只能取内容高度，
+ * 会缩成左上角一小段，贴不住"左缘"，也无法随卡高伸缩。
+ */
 
 .card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--r);
   padding: .55rem .6rem; box-shadow: var(--shadow);
-  display: flex; flex-direction: column; gap: .4rem;
+  /* Task 5 是 column（轨只能缩成左上角一小段）；为了让轨贴住左缘、拉满卡高，改成 row。
+     其余属性逐条沿用 Task 5 的原值，不顺手改它的 spacing 粒度。 */
+  display: flex; flex-direction: row; align-items: stretch; gap: 8px;
+  cursor: grab;                        /* Task 7 的拖拽；本任务尚无拖拽行为 */
 }
 .card:hover { background: var(--lift); }
 /* 5.6：blocked_note 是快照，卡片上只在真的卡住时给信号 */
 .card.is-blocked { border-color: var(--blocked); }
 .card.is-blocked .card-title { color: var(--fg-dim); }
 .card.dragging { opacity: .4; }
+.card:active { cursor: grabbing; }
 
+.card-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .4rem; }
 .card-title { font-size: .9rem; overflow-wrap: anywhere; }
 .card-meta { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
 .card-id { font-family: var(--mono); color: var(--fg-dim); font-size: .75rem; }
@@ -130,6 +137,36 @@ button { cursor: pointer; }
   border: 1px solid var(--blocked);
 }
 
+/* 轨宽 8px、格 6px、格间距 4px（8.8 的 spacing 基准 4px）——整条轨固定 46px。
+ *
+ * 格高**不随卡高伸缩**，这是被实拍逼出来的：格高一旦跟着标题行数变（单行 5.8px、
+ * 三行 17px），8px 的圆点就会溢出所在格，"已过的块 + 当前点"的分格感就没了，
+ * 圆点还会糊到隔壁格上。固定格高换来两件事：圆点是索引的确定函数（slideRail
+ * 的位移恒为 10px 的整数倍），且同一列里所有卡的轨长得一模一样。
+ */
+.rail {
+  position: relative; flex: 0 0 8px; width: 8px; align-self: flex-start;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.rail-seg {
+  position: relative; flex: none; height: 6px;
+  border-radius: 2px; background: transparent;
+}
+/* 索引 < 当前：实心，用**它自己那一态**的颜色（整条轨因此是条状态光谱） */
+.rail-seg.past { background: var(--seg); }
+/* 索引 > 当前：虚线。用 --fg-dim（不是 --st-idea，虽然两者同值），
+   语义上它表示"还没到"，与"已过的 idea"是两回事。 */
+.rail-seg.future { border-top: 1px dashed var(--fg-dim); }
+/* 当前态不铺色，只留一个发光圆点——形状本身就是信号，色盲/灰度下也读得出。
+   圆点直径 = 格高（6px），所以它**待在格子里**，比轨窄 1px，对应 SPEC 的 `├◉┤`。
+   1px 实心描边把圆点补到满轨宽，并把灰卡上的中性灰"抬"起来（8.3 的对比度预警）。 */
+.rail-dot {
+  position: absolute; inset: 0; margin: auto;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--dot);
+  box-shadow: 0 0 0 1px var(--dot), 0 0 4px var(--dot);
+  transition: transform .28s cubic-bezier(.2,.7,.3,1);
+}
+
 /* ------------------------------------------------------------- 读数失败的兜底 */
 
 .boot-error {
@@ -139,15 +176,16 @@ button { cursor: pointer; }
 .boot-error-title { margin: 0 0 .35rem; }
 .boot-error-hint { margin: 0; color: var(--fg-dim); }
 
-/* ------------------------------------------------------------- 抽屉（Task 6/7 填充）
+/* ------------------------------------------------------------- 抽屉（Task 7 填充）
 
-   .drawer 的完整样式在 Task 6 追加。这里必须先把 hidden 语义钉住：
+   .drawer 的完整样式在 Task 7 追加。这里必须先把 hidden 语义钉住：
    作者样式里的 display 会盖过浏览器默认的 [hidden]{display:none}，
-   少了这一行，抽屉在 Task 6 追加样式之前会直接盖满整个视口。 */
+   少了这一行，抽屉在 Task 7 追加样式之前会直接盖满整个视口。 */
 .drawer[hidden] { display: none; }
 
-/* 8.6：动效只做一处（Task 6 的流转轨滑动），其余一律不加；并全部服从
-   prefers-reduced-motion。 */
+/* 8.6：动效全局只做一处（Task 6 的流转轨滑动），其余一律不加；
+   并全部服从 prefers-reduced-motion——这条规则同时保证 slideRail()
+   的 FLIP 位移在 reduce 下瞬间归零，等于不做动画。 */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
