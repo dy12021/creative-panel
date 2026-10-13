@@ -1,38 +1,47 @@
-/* 创意面板 —— 设计令牌 + 骨架样式（Task 5）
+/* 创意面板 —— 设计令牌 + 全部样式
  *
- * 配色基准：本机 SnowLuma 的打包 CSS（client/assets/index-B1pFTpxb.css）的暗色
- * 主题。已核过：SPEC 8.1 的 oklch(13% .008 250) 就是 SnowLuma 暗色 --card 的
- * 原值，SPEC 8.2 的几个状态色也都能在该文件里逐个对上；本次只是按本项目需要
- * 归一化到两位小数并重排了明度梯度。
+ * 硬约束（不可动摇）：零 CDN。不下载字体、不引图标库、不引任何外链资源，
+ * 断网必须完全可用。所以字体只能在系统栈里挑——见下面的 --display。
  *
- * 硬约束：零 CDN。不下载字体、不引图标库、不引任何外链资源，断网必须完全可用。
+ * 设计取向：明亮的纸面 + 一条地铁线式的流转轨。
+ * 轨不是五段方块，是一条连续的线加五个站：走过的站填成它自己的颜色，
+ * 当前站是一个带白环的"你在这里"，没到的站是空心的。线往右走，
+ * 创意就是那趟车。这比五段竖条更贴切——竖条本来就横不过来。
  */
 
+/* ------------------------------------------------------------------ 令牌 */
+
 :root {
-  color-scheme: dark;   /* 原生控件（select / input / 滚动条）跟随暗色，否则下拉是白底 */
+  color-scheme: light;   /* 原生 select / 滚动条跟着亮色，否则下拉是黑底 */
 
-  /* 8.1 底色：单色冷灰，全部 hue 250，彩度极低 */
-  --bg:      oklch(13% .008 250);
-  --panel:   oklch(15% .01  250);
-  --card:    oklch(17% .012 250);
-  --lift:    oklch(19% .012 250);
-  --border:  oklch(20% .03  250 / .28);
-  --fg:      oklch(98% .005 240);
-  --fg-dim:  oklch(66% .02  240);
+  /* 纸面：冷调，不是暖米色。刻意比纯白深一档，卡片浮起来才有层次。 */
+  --bg:     #EDF0F4;
+  --panel:  #F6F8FA;
+  --card:   #FFFFFF;
+  --lift:   #F9FBFC;
+  --border: #DBE1E9;
+  --line:   #E6EAF0;
+  --fg:     #15181D;     /* 墨色 */
+  --fg-dim: #69717E;
 
-  /* 8.2 状态色：灰 -> 冷 -> 冷紫 -> 暖 -> 绿。红色全部留给阻塞。 */
-  --st-idea:       oklch(66% .02  240);
-  --st-clarifying: oklch(75% .14  230);
-  --st-clarified:  oklch(70% .18  293);
-  --st-building:   oklch(80% .16  80);
-  --st-done:       oklch(72% .15  160);
-  --blocked:       oklch(62% .2   27);
+  /* 五态：灰 → 冷 → 冷紫 → 暖 → 绿。红色全部留给阻塞。 */
+  --st-idea:       #8A93A2;
+  --st-clarifying: #2E86C8;
+  --st-clarified:  #7B4DD6;
+  --st-building:   #D4860B;
+  --st-done:       #1B9A67;
+  --blocked:       #D33F35;
 
-  /* 8.7 / 8.8 */
-  --r: 1rem;                        /* radius-2xl */
-  --shadow: 0 1px 2px rgba(0,0,0,.15);
-  --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --mono: ui-monospace, Consolas, "Liberation Mono", monospace;
+  --r:    10px;
+  --r-sm: 6px;
+  --shadow: 0 1px 2px rgba(21,32,51,.06), 0 4px 12px rgba(21,32,51,.04);
+
+  /* 显示体：Bahnschrift 是 Windows 10+ 自带的 DIN 风格窄体 grotesk，
+     自带不同宽度轴，用来做列头大数字正好——工业味、不下载、离线可用。
+     中文回落雅黑；正文字体负责全部中文内容。 */
+  --display: "Bahnschrift", "DIN Alternate", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font: "Segoe UI", -apple-system, system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --mono: "Cascadia Mono", ui-monospace, Consolas, "Liberation Mono", monospace;
 }
 
 * { box-sizing: border-box; }
@@ -42,241 +51,283 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--font);
-  font-size: .84rem;
-  line-height: 1.45;
+  font-size: .875rem;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
 }
 
-h1 { font-size: 1.05rem; letter-spacing: -.025em; margin: 0; }
-button, input, select { font: inherit; color: inherit; }
+h1 { font-family: var(--display); font-size: 1rem; letter-spacing: .01em; margin: 0; }
+button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 
-:focus-visible { outline: 2px solid var(--st-clarified); outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--st-clarifying); outline-offset: 2px; border-radius: 3px; }
 
-/* 暗色底上的默认亮色滚动条很难看，跟本机 media-center-pms 的做法一致 */
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: oklch(30% .02 250); border-radius: 4px; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #C9D1DC; border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: #B4BECC; border: 2px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* ------------------------------------------------------------- 工具条 */
+/* ------------------------------------------------------------------ 工具条 */
 
 .toolbar {
-  display: flex; gap: .75rem; align-items: center; padding: .75rem 1rem;
+  display: flex; gap: .6rem; align-items: center; padding: .7rem 1.1rem;
   background: var(--panel); border-bottom: 1px solid var(--border);
   position: sticky; top: 0; z-index: 10;
 }
 .toolbar input[type=search] {
-  flex: 0 0 16rem; background: var(--card); color: var(--fg);
-  border: 1px solid var(--border); border-radius: var(--r); padding: .4rem .6rem;
+  flex: 0 0 17rem; background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .4rem .65rem;
 }
 .toolbar select {
   background: var(--card); color: var(--fg);
-  border: 1px solid var(--border); border-radius: var(--r); padding: .4rem .6rem;
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .4rem .6rem;
 }
-.toolbar .toggle { display: flex; align-items: center; gap: .35rem; color: var(--fg-dim); }
+.toolbar input[type=search]:focus, .toolbar select:focus { border-color: var(--st-clarifying); }
+.toolbar .toggle { display: flex; align-items: center; gap: .4rem; color: var(--fg-dim); }
+.toolbar .toggle input { accent-color: var(--blocked); }
 .toolbar .primary {
-  margin-left: auto; background: var(--st-clarified); color: var(--bg);
-  border: 0; border-radius: var(--r); padding: .45rem .9rem; font-weight: 600;
+  margin-left: auto; background: var(--st-clarified); color: #fff;
+  border: 0; border-radius: var(--r-sm); padding: .45rem .95rem; font-weight: 600;
 }
+.toolbar .primary:hover { filter: brightness(1.08); }
 
-/* ------------------------------------------------------------- 五列看板 */
+/* ------------------------------------------------------------------ 五列看板 */
 
-/* 8.4：统计数字直接做列头的 mono 大数字，不单占一行 */
 .board {
-  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .75rem;
-  padding: .75rem; align-items: start; min-height: calc(100vh - 3.4rem);
+  flex: 1 1 auto;
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .7rem;
+  padding: .7rem 1.1rem 1.1rem;
+  align-items: stretch;      /* 列拉满高度，不留一块空地板 */
 }
 .col {
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--r); padding: .6rem; min-height: 8rem;
+  border-radius: var(--r); padding: .7rem .7rem .8rem;
+  display: flex; flex-direction: column;
+  min-height: 12rem;
 }
-.col-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .6rem; }
-.col-count { font-family: var(--mono); font-size: 1.5rem; line-height: 1; color: var(--fg); }
-.col-name { color: var(--fg-dim); }
-.col-list { display: flex; flex-direction: column; gap: .5rem; min-height: 2rem; }
+/* 列头：状态名左边一道该态的色条，数字用显示体 */
+.col-head { display: flex; align-items: center; gap: .55rem; margin-bottom: .7rem; }
+.col-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c, var(--st-idea)); flex: none; }
+.col-count {
+  font-family: var(--display); font-size: 1.6rem; line-height: 1;
+  color: var(--fg); font-weight: 600;
+}
+.col-name { color: var(--fg-dim); margin-left: auto; }
+.col-list { display: flex; flex-direction: column; gap: .5rem; flex: 1 1 auto; min-height: 2rem; }
 .col-add {
-  width: 100%; margin-top: .5rem; background: transparent; color: var(--fg-dim);
-  border: 1px dashed var(--border); border-radius: var(--r); padding: .35rem;
+  width: 100%; margin-top: .55rem; background: transparent; color: var(--fg-dim);
+  border: 1px dashed var(--border); border-radius: var(--r-sm); padding: .4rem;
 }
-.col-add:hover { color: var(--fg); border-color: var(--fg-dim); }
-/* Task 7 拖拽时给目标列加的提示态 */
-.col.drop-hint { outline: 2px dashed var(--fg-dim); outline-offset: -2px; }
+.col-add:hover { color: var(--fg); border-color: var(--fg-dim); background: var(--card); }
+.col.drop-hint { outline: 2px dashed var(--st-clarifying); outline-offset: -2px; background: var(--card); }
 
-/* ------------------------------------------------------------- 卡片与流转轨
- *
- * 8.3 的签名元素：卡片左缘一条竖直窄条，自上而下 5 格。
- * 卡片因此改成横向 flex（左轨 + 右内容列）——纵向 flex 里轨只能取内容高度，
- * 会缩成左上角一小段，贴不住"左缘"，也无法随卡高伸缩。
- */
+/* ------------------------------------------------------------------ 卡片 */
 
 .card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--r);
-  padding: .55rem .6rem; box-shadow: var(--shadow);
-  /* Task 5 是 column（轨只能缩成左上角一小段）；为了让轨贴住左缘、拉满卡高，改成 row。
-     其余属性逐条沿用 Task 5 的原值，不顺手改它的 spacing 粒度。 */
-  display: flex; flex-direction: row; align-items: stretch; gap: 8px;
-  cursor: grab;                        /* Task 7 的拖拽；本任务尚无拖拽行为 */
+  padding: .6rem .65rem .55rem; box-shadow: var(--shadow);
+  display: flex; flex-direction: column;   /* 轨改成横向，卡片回到纵向 */
+  cursor: grab;
+  transition: border-color .15s, box-shadow .15s;
 }
-.card:hover { background: var(--lift); }
-/* 5.6：blocked_note 是快照，卡片上只在真的卡住时给信号 */
+.card:hover { border-color: #C6CFDA; box-shadow: 0 2px 4px rgba(21,32,51,.07), 0 8px 18px rgba(21,32,51,.07); }
+.card:active { cursor: grabbing; }
 .card.is-blocked { border-color: var(--blocked); }
 .card.is-blocked .card-title { color: var(--fg-dim); }
-.card.dragging { opacity: .4; }
-.card:active { cursor: grabbing; }
+.card.dragging { opacity: .45; }
 
-.card-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .4rem; }
-.card-title { font-size: .9rem; overflow-wrap: anywhere; }
+.card-body { display: flex; flex-direction: column; gap: .4rem; }
+.card-title { font-size: .9rem; font-weight: 600; overflow-wrap: anywhere; }
 .card-meta { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
-.card-id { font-family: var(--mono); color: var(--fg-dim); font-size: .75rem; }
+.card-id { font-family: var(--mono); color: var(--fg-dim); font-size: .72rem; }
 .tag {
-  font-size: .7rem; color: var(--fg-dim); background: var(--panel);
-  border-radius: 999px; padding: .05rem .45rem;
+  font-size: .68rem; color: var(--fg-dim); background: var(--bg);
+  border-radius: 999px; padding: .1rem .5rem;
 }
-.tag.is-blocked-tag {
-  color: var(--blocked); background: transparent;
-  border: 1px solid var(--blocked);
-}
+.tag.is-blocked-tag { color: var(--blocked); background: color-mix(in srgb, var(--blocked) 8%, transparent); }
 
-/* 轨宽 8px、格 6px、格间距 4px（8.8 的 spacing 基准 4px）——整条轨固定 46px。
+/* ------------------------------------------------- 流转轨：一条地铁线
  *
- * 格高**不随卡高伸缩**，这是被实拍逼出来的：格高一旦跟着标题行数变（单行 5.8px、
- * 三行 17px），8px 的圆点就会溢出所在格，"已过的块 + 当前点"的分格感就没了，
- * 圆点还会糊到隔壁格上。固定格高换来两件事：圆点是索引的确定函数（slideRail
- * 的位移恒为 10px 的整数倍），且同一列里所有卡的轨长得一模一样。
+ * 五站一线。每格各画一段轨道线，首尾相接成一条连续线；线不伸出两端。
+ *   走过的站  实心圆点，用**它自己那一态**的颜色——整条线因此是一条状态光谱
+ *   当前站    大一号的实心点，外圈留一圈卡面白的环，把点和线断开 = "你在这里"
+ *   没到的站  空心点
+ * 阻塞时只有当前站转红（.card.is-blocked 负责卡片描边），线不整条涂红。
  */
+
 .rail {
-  position: relative; flex: 0 0 8px; width: 8px; align-self: flex-start;
-  display: flex; flex-direction: column; gap: 4px;
+  position: relative; display: flex; align-items: center;
+  width: 100%; height: 14px; margin-bottom: .45rem;
 }
 .rail-seg {
-  position: relative; flex: none; height: 6px;
-  border-radius: 2px; background: transparent;
+  position: relative; flex: 1 1 0; height: 14px;
+  display: flex; align-items: center; justify-content: center;
 }
-/* 索引 < 当前：实心，用**它自己那一态**的颜色（整条轨因此是条状态光谱） */
-.rail-seg.past { background: var(--seg); }
-/* 索引 > 当前：虚线。用 --fg-dim（不是 --st-idea，虽然两者同值），
-   语义上它表示"还没到"，与"已过的 idea"是两回事。 */
-.rail-seg.future { border-top: 1px dashed var(--fg-dim); }
-/* 当前态不铺色，只留一个发光圆点——形状本身就是信号，色盲/灰度下也读得出。
-   圆点直径 = 格高（6px），所以它**待在格子里**，比轨窄 1px，对应 SPEC 的 `├◉┤`。
-   1px 实心描边把圆点补到满轨宽，并把灰卡上的中性灰"抬"起来（8.3 的对比度预警）。 */
-.rail-dot {
-  position: absolute; inset: 0; margin: auto;
-  width: 6px; height: 6px; border-radius: 50%; background: var(--dot);
-  box-shadow: 0 0 0 1px var(--dot), 0 0 4px var(--dot);
-  transition: transform .28s cubic-bezier(.2,.7,.3,1);
+.rail-seg::before {
+  content: ""; position: absolute; top: 50%; left: 0; right: 0;
+  height: 2px; margin-top: -1px; border-radius: 1px;
+  background: var(--line, var(--line-weak, #E1E6ED));
+}
+.rail-seg:first-child::before { left: 50%; }
+.rail-seg:last-child::before { right: 50%; }
+
+.rail-seg.past { --line: var(--seg); --line-weak: var(--seg); }
+.rail-seg.future { --line: var(--border); }
+
+.rail-dot { position: relative; display: block; }
+.rail-seg.past .rail-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--dot);
+}
+.rail-seg.future .rail-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--card); box-shadow: inset 0 0 0 1.5px var(--fg-dim);
+}
+.rail-seg.now .rail-dot {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--dot);
+  box-shadow: 0 0 0 3px var(--card);          /* 白环把点从线上"抬"起来 */
+}
+.rail-dot { transition: transform .3s cubic-bezier(.2,.7,.3,1); }
+
+/* ------------------------------------------------------------------ 新建/编辑表单
+ *
+ * 原来是 window.prompt：浏览器自己弹个灰白小框，样式不受控、不能填标签、
+ * 弹窗一关输入就没了。改成页面内的 <dialog>，字段、校验、焦点都在页面里。
+ */
+
+.composer {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0;
+  width: min(30rem, 92vw); background: var(--card); color: var(--fg);
+  box-shadow: 0 24px 64px rgba(21,32,51,.22);
+}
+.composer::backdrop { background: rgba(23,32,45,.34); }
+.composer-inner { padding: 1.1rem 1.2rem 1.2rem; }
+.composer-title { font-family: var(--display); font-size: 1.05rem; margin: 0 0 .9rem; }
+.field { display: flex; flex-direction: column; gap: .3rem; margin-bottom: .75rem; }
+.field > span { font-size: .75rem; color: var(--fg-dim); font-weight: 600; letter-spacing: .03em; }
+.field input, .field textarea {
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .45rem .6rem;
+  width: 100%;
+}
+.field input:focus, .field textarea:focus { border-color: var(--st-clarifying); background: var(--card); }
+.field textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
+.composer-actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+.composer-actions .primary {
+  background: var(--st-clarified); color: #fff; border: 0;
+  border-radius: var(--r-sm); padding: .45rem 1rem; font-weight: 600;
+}
+.composer-actions .secondary {
+  background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: .45rem .9rem;
+}
+.composer-actions .secondary:hover { color: var(--fg); background: var(--panel); }
+
+/* 抽屉里的阻塞原因输入：同一个 window.prompt 反模式，一并换成页面内的 */
+.block-form { display: flex; gap: .4rem; align-items: center; margin-top: .4rem; }
+.block-input {
+  flex: 1 1 auto; min-width: 0; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .35rem .5rem;
 }
 
-/* ------------------------------------------------------------- 读数失败的兜底 */
+/* ------------------------------------------------------------------ 读数失败的兜底 */
 
 .boot-error {
-  grid-column: 1 / -1; border: 1px solid var(--border);
-  border-radius: var(--r); background: var(--panel); padding: 1rem;
+  grid-column: 1 / -1; border: 1px solid var(--blocked); border-radius: var(--r);
+  background: var(--card); padding: 1rem 1.1rem;
 }
-.boot-error-title { margin: 0 0 .35rem; }
+.boot-error-title { margin: 0 0 .35rem; font-family: var(--display); }
 .boot-error-hint { margin: 0; color: var(--fg-dim); }
 
-/* ------------------------------------------------------------- 抽屉（Task 7）
- *
- * .drawer 的完整样式在 Task 7 追加。这里必须先把 hidden 语义钉住：
- * 作者样式里的 display 会盖过浏览器默认的 [hidden]{display:none}，
- * 少了这一行，抽屉在 Task 7 追加样式之前会直接盖满整个视口。 */
+/* ------------------------------------------------------------------ 抽屉 */
+
 .drawer[hidden] { display: none; }
 
-/* 8.5：右侧抽屉。fixed 贴右边，宽度够放时间线又不至于盖住整块看板
-   （SPEC 12 只保证桌面 1280px 以上，所以宽度用 vw 上限兜住）。 */
 .drawer {
   position: fixed; top: 0; right: 0; bottom: 0;
-  width: min(26rem, 40vw);
-  background: var(--panel);
+  width: min(27rem, 42vw);
+  background: var(--card);
   border-left: 1px solid var(--border);
-  box-shadow: -8px 0 24px rgba(0,0,0,.35);
-  overflow-y: auto;
-  z-index: 20;
+  box-shadow: -12px 0 40px rgba(21,32,51,.12);
+  overflow-y: auto; z-index: 20;
 }
 .drawer-inner { padding: 1rem 1.1rem 2rem; position: relative; }
 .drawer-close {
   position: absolute; top: .7rem; right: .8rem;
   background: transparent; color: var(--fg-dim);
-  border: 0; font-size: 1rem; line-height: 1; padding: .2rem .35rem;
+  border: 0; font-size: 1rem; line-height: 1; padding: .2rem .4rem; border-radius: 4px;
 }
-.drawer-close:hover { color: var(--fg); }
+.drawer-close:hover { color: var(--fg); background: var(--panel); }
 
-.drawer-title { font-size: 1rem; margin: 0 2rem .3rem 0; padding-right: 2rem; overflow-wrap: anywhere; }
-.drawer-sub { display: flex; gap: .5rem; align-items: baseline; color: var(--fg-dim); margin-bottom: .4rem; }
+.drawer-title { font-size: 1.05rem; margin: 0 2rem .3rem 0; font-weight: 600; overflow-wrap: anywhere; }
+.drawer-sub { display: flex; gap: .55rem; align-items: baseline; color: var(--fg-dim); margin-bottom: .4rem; }
 .drawer-id { font-family: var(--mono); font-size: .75rem; }
-.drawer-status { color: var(--fg); }
+.drawer-status { color: var(--fg); font-weight: 600; }
 .drawer-source { font-size: .75rem; }
 .sec-h {
-  font-size: .72rem; color: var(--fg-dim); margin: 1.1rem 0 .35rem;
-  font-weight: 600; letter-spacing: .04em;
+  font-size: .72rem; color: var(--fg-dim); margin: 1.2rem 0 .4rem;
+  font-weight: 600; letter-spacing: .06em;
 }
-.drawer-body-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+.drawer-body-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; color: var(--fg); }
 
 .tag-form, .advance-form { display: flex; gap: .4rem; flex-wrap: wrap; }
 .tag-input, .advance-note, .advance-sel {
-  background: var(--card); color: var(--fg);
-  border: 1px solid var(--border); border-radius: var(--r); padding: .35rem .5rem;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .35rem .5rem;
 }
 .tag-input, .advance-note { flex: 1 1 10rem; min-width: 0; }
 .advance-note { flex: 1 1 8rem; }
 
 .advance-form .primary {
-  background: var(--st-clarified); color: var(--bg); border: 0;
-  border-radius: var(--r); padding: .35rem .8rem; font-weight: 600;
-  margin-left: 0;
+  background: var(--st-clarified); color: #fff; border: 0;
+  border-radius: var(--r-sm); padding: .35rem .8rem; font-weight: 600; margin-left: 0;
 }
-.advance-form button:disabled, .tag-form button:disabled { opacity: .5; cursor: default; }
+.advance-form button:disabled, .tag-form button:disabled { opacity: .45; cursor: default; }
 
-/* 阻塞相关 */
 .warn { background: transparent; color: var(--blocked); border: 1px solid var(--blocked);
-  border-radius: var(--r); padding: .35rem .8rem; }
+  border-radius: var(--r-sm); padding: .35rem .8rem; }
 .secondary { background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
-  border-radius: var(--r); padding: .35rem .8rem; }
-.secondary:hover { color: var(--fg); }
-.blocked-note { color: var(--fg-dim); font-size: .8rem; margin: .4rem 0 0; }
+  border-radius: var(--r-sm); padding: .35rem .8rem; }
+.secondary:hover { color: var(--fg); background: var(--panel); }
+.blocked-note { color: var(--fg-dim); font-size: .8rem; margin: .45rem 0 0; }
 
-/* 时间线：when / actor / text 三列网格 */
-.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; }
+/* 时间线 */
+.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .35rem; }
 .tl-item {
-  display: grid; grid-template-columns: 4.6rem 2.6rem 1fr; gap: .4rem;
-  font-size: .78rem; align-items: baseline; line-height: 1.4;
+  display: grid; grid-template-columns: 4.8rem 2.4rem 1fr; gap: .45rem;
+  font-size: .78rem; align-items: baseline; line-height: 1.45;
+  padding-bottom: .35rem; border-bottom: 1px solid var(--line);
 }
+.tl-item:last-child { border-bottom: 0; }
 .ev-when { font-family: var(--mono); color: var(--fg-dim); font-size: .72rem; }
-.ev-actor { color: var(--st-clarifying); }
+.ev-actor { color: var(--st-clarifying); font-size: .72rem; }
 .ev-text { color: var(--fg); overflow-wrap: anywhere; }
 .tl-empty { color: var(--fg-dim); }
 
-/* 抽屉内的错误/提示。detail 恒为人话（SPEC 第 9 节），直接显示即可 */
 .drawer-msg, .board-msg {
-  border-radius: var(--r); padding: .4rem .6rem;
-  font-size: .78rem; border: 1px solid var(--border); color: var(--fg-dim);
+  border-radius: var(--r-sm); padding: .45rem .65rem;
+  font-size: .78rem; border: 1px solid var(--border); background: var(--panel); color: var(--fg-dim);
 }
 .drawer-msg { margin: 0 0 .6rem; }
 .drawer-msg[hidden], .board-msg[hidden] { display: none; }
-/* 抽屉关着时的横幅：工具条下方一条，用户拖拽失败时看得到 */
-.board-msg { margin: .6rem .75rem 0; }
-.drawer-msg.is-bad, .board-msg.is-bad { color: var(--blocked); border-color: var(--blocked); }
+.board-msg { margin: 0 1.1rem; }
+.drawer-msg.is-bad, .board-msg.is-bad { color: var(--blocked); border-color: var(--blocked); background: color-mix(in srgb, var(--blocked) 6%, transparent); }
 .drawer-msg.is-warn, .board-msg.is-warn { color: var(--st-building); border-color: var(--st-building); }
 .drawer-error { color: var(--blocked); }
 
-/* ------------------------------------------------------------- 拖拽（Task 7）
- *
- * 8.5：拖动时显示落点占位块 #0000001a（沿用 SnowLuma 的做法）。
- * 这个色值是 8 位十六进制带 alpha 的黑色（约 10% 不透明），压在任何列底色上
- * 都只是一层极淡的影——正合适：占位块该"在那儿"但不该抢戏。 */
+/* ------------------------------------------------------------------ 拖拽 */
+
 .drop-ph {
   height: 2px; border-radius: 1px;
-  background: #0000001a;
-  outline: 1px solid #0000001a;
-  outline-offset: 1px;
+  background: #15181D1F;
+  outline: 1px solid #15181D1F; outline-offset: 1px;
   margin: .1rem 0;
 }
-.card:focus-visible { outline: 2px solid var(--st-clarified); outline-offset: 2px; }
+.card:focus-visible { outline: 2px solid var(--st-clarifying); outline-offset: 2px; }
 
-/* 8.6：动效全局只做一处（Task 6 的流转轨滑动），其余一律不加；
-   并全部服从 prefers-reduced-motion——这条规则同时保证 slideRail()
-   的 FLIP 位移在 reduce 下瞬间归零，等于不做动画。 */
+/* 8.6：动效只做一处（流转轨滑动），其余不加；并全部服从 prefers-reduced-motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }

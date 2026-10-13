@@ -94,6 +94,9 @@ function render() {
     const items = state.items.filter(i => i.status === st)
       .sort((a, b) => a.position - b.position || a.id - b.id);
     head.append(el("span", "col-count", items.length));
+    const dot = el("span", "col-dot");
+    dot.style.setProperty("--c", "var(--st-" + st + ")");
+    head.append(dot);
     head.append(el("span", "col-name", STATUS_LABEL[st]));
     col.append(head);
 
@@ -113,13 +116,13 @@ function render() {
 
 /* ------------------------------------------------------------- 流转轨（SPEC 8.3）
  *
- * 本产品区别于通用任务板的签名元素：卡片左缘一条竖直窄条，自上而下 5 格，
- * 一格对应一个状态。**渲染完全按索引决定，不按"走过的路径"**——所以跳跃推进时
- * （idea 直接到 building），被跳过的态一律算"已过"，前 3 格全是实心。
- * 已过的格子用**它自己那一态的颜色**，整条轨因此是一条状态光谱。
+ * 本产品区别于通用任务板的签名元素：卡片顶部一条**横向**的地铁线，五站对应五个状态。
+ * **渲染完全按索引决定，不按"走过的路径"**——所以跳跃推进时（idea 直接到 building），
+ * 被跳过的态一律算"已过"，前 3 站全是实心。走过的站用**它自己那一态的颜色**，
+ * 整条线因此是一条状态光谱。
  *
- * 阻塞时**只**把当前态圆点转红（卡片红描边由 .card.is-blocked 负责），
- * 绝不能把整条轨涂红——那会丢掉"走到哪一步"，正是流转轨存在的意义。
+ * 阻塞时**只**把当前站转红（卡片红描边由 .card.is-blocked 负责），
+ * 绝不能把整条线涂红——那会丢掉"走到哪一步"，正是流转轨存在的意义。
  */
 
 // 就地把一条轨重画成 status 的样子。抽出来是为了 slideRail 能"先量后改"：
@@ -129,18 +132,19 @@ function paintRail(rail, status, blocked) {
   rail.textContent = "";                     // 先清干净，避免重画时叠出两层格
   rail.dataset.status = status;
   STATUS_ORDER.forEach((st, i) => {
-    // 未知状态名只会让 idx=-1，于是 5 格全判成 future 且没有当前圆点，
+    // 未知状态名只会让 idx=-1，于是 5 站全判成 future 且没有当前圆点，
     // 不会抛异常；服务端本来就用白名单约束 status，这里只是兜底。
     const seg = el("span", "rail-seg " + (idx < 0 ? "future" : i < idx ? "past" : i === idx ? "now" : "future"));
     seg.dataset.status = st;
     seg.style.setProperty("--seg", "var(--st-" + st + ")");
     seg.title = STATUS_LABEL[st];
-    if (i === idx) {
-      // 圆点是轨上唯一的"当前"信号，红色也只落在它身上（SPEC 8.2）
-      const dot = el("span", "rail-dot");
-      dot.style.setProperty("--dot", blocked ? "var(--blocked)" : "var(--st-" + st + ")");
-      seg.append(dot);
-    }
+    // **每一站都要有圆点**：地铁线的"站"是实体，缺了站就只剩一根线，
+    // 读不出"五站"、也读不出卡在第几站。走过的站实心（它自己那态的颜色）、
+    // 没到的站空心，由 CSS 按 .past/.future 分化。
+    const dot = el("span", "rail-dot");
+    // 红色也只落在**当前站**身上（SPEC 8.2）
+    dot.style.setProperty("--dot", blocked && i === idx ? "var(--blocked)" : "var(--st-" + st + ")");
+    seg.append(dot);
     rail.append(seg);
   });
   return rail;
@@ -164,23 +168,25 @@ function buildRail(status, blocked) {
  */
 function slideRail(rail, toStatus, blocked) {
   const same = rail.dataset.status === toStatus;
-  const dot = rail.querySelector(".rail-dot");
-  const fromTop = dot ? dot.getBoundingClientRect().top : 0;
+  // 必须取**当前站**那个圆点。现在每站都有圆点了，querySelector(".rail-dot")
+  // 会抓到第一站（永远在最左），量出来的位移恒为 0，动画直接失效。
+  const dot = rail.querySelector(".rail-seg.now .rail-dot");
+  // 轨现在是**横向**的一条地铁线，圆点是沿着 X 轴换站，所以量 left、位移也用 X。
+  const fromLeft = dot ? dot.getBoundingClientRect().left : 0;
   paintRail(rail, toStatus, blocked);
   if (same) return;                      // 只是阻塞态翻转，没有位移可播
-  const dot2 = rail.querySelector(".rail-dot");
-  if (!dot2) return;                                   // 目标态认不出来，没有可滑的圆点
-  const dy = fromTop - dot2.getBoundingClientRect().top;
-  if (Math.abs(dy) < .5) return;                       // 没有实际位移，不播动画
+  const dot2 = rail.querySelector(".rail-seg.now .rail-dot");
+  if (!dot2) return;                     // 目标态认不出来，没有可滑的圆点
+  const dx = fromLeft - dot2.getBoundingClientRect().left;
+  if (Math.abs(dx) < .5) return;                       // 没有实际位移，不播动画
   dot2.style.transition = "none";
-  dot2.style.transform = "translateY(" + dy + "px)";
+  dot2.style.transform = "translateX(" + dx + "px)";
   void dot2.offsetHeight;                              // 强制回流，把反向位移先落定再放行
   dot2.style.transition = "";                          // 交回样式表里的 transition
   dot2.style.transform = "";
 }
 
-// 卡片本体。流转轨接在左缘，内容装进 .card-body（卡片是横向 flex，轨才贴得住左缘）。
-// 点开抽屉由 Task 7 接进来。
+// 卡片本体。流转轨在卡片顶部横着一条，下面是内容。点开抽屉由 Task 7 接进来。
 function card(i) {
   const c = el("article", "card");
   c.dataset.id = i.id;
@@ -377,18 +383,29 @@ function drawDrawer(id, idea) {
 
   /* 阻塞按钮。注意请求体字段：block 收 {reason}，不是 note（SPEC 5.6）。 */
   body.append(el("h3", "sec-h", "阻塞"));
+  const blockForm = el("div", "block-form");
+  const reasonInput = el("input", "block-input");
+  reasonInput.id = "block-reason";
+  reasonInput.placeholder = "卡在哪了？";
+  reasonInput.autocomplete = "off";
   const bBtn = el("button", (idea.blocked ? "secondary" : "warn") + " block-btn",
                   idea.blocked ? "解除阻塞" : "标记卡住");
+  if (idea.blocked) {
+    blockForm.append(bBtn);
+  } else {
+    reasonInput.addEventListener("keydown", e => { if (e.key === "Enter") bBtn.click(); });
+    blockForm.append(reasonInput, bBtn);
+  }
   bBtn.onclick = async () => {
     bBtn.disabled = true;
     try {
       if (idea.blocked) {
         await api("POST", "/api/ideas/" + id + "/unblock");
       } else {
-        const r = window.prompt("卡在哪了？");
-        if (r === null) return;           // 用户取消，不是错误
-        if (!r.trim()) { drawerMsg("阻塞原因不能为空", "warn"); return; }
-        await api("POST", "/api/ideas/" + id + "/block", { reason: r.trim() });
+        // 阻塞原因同样是页面内输入，不用 window.prompt（同一个反模式）。
+        const r = document.getElementById("block-reason").value.trim();
+        if (!r) { drawerMsg("阻塞原因不能为空", "warn"); return; }
+        await api("POST", "/api/ideas/" + id + "/block", { reason: r });
       }
       await load();
       const got = await api("GET", "/api/ideas/" + id);
@@ -400,7 +417,7 @@ function drawDrawer(id, idea) {
       bBtn.disabled = false;
     }
   };
-  body.append(bBtn);
+  body.append(blockForm);
   // 5.6：blocked_note 只是当前快照，只在真的卡住时渲染，
   // 否则会出现"没卡住却挂着旧原因"的错觉
   if (idea.blocked) {
@@ -582,19 +599,43 @@ document.addEventListener("keydown", e => {
   if (c) { e.preventDefault(); openDrawer(+c.dataset.id); }
 });
 
-// 快捷登记
-async function quickNew() {
-  const title = window.prompt("这个创意是什么？");
-  if (title === null) return;                // 取消，不是错误
-  if (!title.trim()) return;
+// 快捷登记：打开页面内的 <dialog> 表单，不是 window.prompt。
+// prompt 只能填一个字段、样式不受控、一关输入就没了；这里标题/描述/标签都能填。
+function quickNew() {
+  const dlg = document.getElementById("composer");
+  document.getElementById("c-title").value = "";
+  document.getElementById("c-body").value = "";
+  document.getElementById("c-tags").value = "";
+  dlg.showModal();
+  document.getElementById("c-title").focus();
+}
+
+document.getElementById("c-cancel").onclick = () => document.getElementById("composer").close();
+
+document.getElementById("composer-form").addEventListener("submit", async e => {
+  // <form method="dialog"> 默认会直接关掉；先 preventDefault，自己走异步提交，
+  // 失败时对话框要留着让人改，成功才关。
+  e.preventDefault();
+  const title = document.getElementById("c-title").value.trim();
+  if (!title) return;
+  const body = document.getElementById("c-body").value.trim();
+  const tags = document.getElementById("c-tags").value.trim();
+  const save = document.getElementById("c-save");
+  save.disabled = true;
   try {
-    const got = await api("POST", "/api/ideas", { title: title.trim() });
+    const payload = { title: title };
+    if (body) payload.body = body;
+    if (tags) payload.tags = tags;
+    const got = await api("POST", "/api/ideas", payload);
+    document.getElementById("composer").close();
     await load();
     openDrawer(got.id);
-  } catch (e) {
-    drawerMsg(e.message, "bad");
+  } catch (err) {
+    drawerMsg(err.message, "bad");
+  } finally {
+    save.disabled = false;
   }
-}
+});
 
 /* 计划里说这批名字"暴露给 Task 6/7"。同一文件内互相引用靠裸名字就够了，
    但顶层 const 声明不会挂到 window 上——浏览器控制台敲 window.state 会拿到

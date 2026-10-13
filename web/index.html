@@ -21,6 +21,32 @@
 
   <main class="board" id="board"></main>
 
+  <!-- 记一个想法：页面内的表单。
+       原来是 window.prompt——浏览器自带的小灰框，样式不受控、只能填一个字段、
+       一关就没了。换成 <dialog>：标题/描述/标签三个字段都在页面里，
+       原生自带 Esc 关闭与焦点约束，不需要自己写。 -->
+  <dialog class="composer" id="composer">
+    <form class="composer-inner" id="composer-form" method="dialog">
+      <h2 class="composer-title" id="composer-title">记一个想法</h2>
+      <label class="field">
+        <span>想法</span>
+        <input id="c-title" required maxlength="200" placeholder="一句话说清这是什么" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>描述（可留空）</span>
+        <textarea id="c-body" placeholder="为什么想做、给谁看、要什么效果"></textarea>
+      </label>
+      <label class="field">
+        <span>标签（逗号分隔，可留空）</span>
+        <input id="c-tags" placeholder="视频,叙事" autocomplete="off">
+      </label>
+      <div class="composer-actions">
+        <button class="secondary" type="button" id="c-cancel">算了</button>
+        <button class="primary" type="submit" id="c-save">记下来</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- 抽屉：Task 7 填充内容。本任务只保证它开局是关着的。 -->
   <aside class="drawer" id="drawer" hidden>
     <div class="drawer-inner">
