@@ -23,7 +23,7 @@ const state = {
 /* 抽屉里「项目文档」区块的临时状态。
  * 清单随抽屉重绘从 idea.docs 来（GET /api/ideas/{id} 一次就带 docs），
  * 正文按需取：cache[docId] 存已读回来的 content，重绘时不必再打一次请求。 */
-const docsState = { ideaId: null, docs: [], open: null, cache: {} };
+const docsState = { ideaId: null, docs: [], open: null, cache: {}, host: null };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -315,6 +315,130 @@ async function openDrawer(id) {
   drawDrawer(id, idea);
 }
 
+/* ------------------------------------------------------------ 分区与字段块
+ *
+ * 抽屉**默认是只读的**（用户 2026-10-13：「默认就是编辑模式，底下的时间线跟
+ * 调试模式似的」）。原来每个字段都是输入框 + 一个保存按钮，满屏灰框——那不是
+ * 详情页，是调试表单，看的人根本没得看。现在每个区块有「只读 / 编辑」两态，
+ * 点标题右侧的编辑才进编辑态，存完回只读。
+ *
+ * 推进与阻塞**不是字段是动作**，常驻显示是对的：它们本来就该一眼可见、可点。
+ */
+
+function section(parent, title, action) {
+  const sec = el("section", "sec");
+  const head = el("div", "sec-head");
+  head.append(el("h3", "sec-h", title));
+  if (action) head.append(action);
+  const slot = el("div", "sec-slot");
+  sec.append(head, slot);
+  parent.append(sec);
+  return slot;
+}
+
+function miniBtn(text, title) {
+  const b = el("button", "mini", text);
+  b.type = "button";
+  if (title) b.title = title;
+  return b;
+}
+
+/* 只读 <-> 编辑 的字段块。
+ *
+ * 保存回调拿到的是**服务端回填后的值**再切回只读：服务端会规范化（去首尾空白），
+ * 不回填就会出现「存了但看着没变」，而这个错只有在回读账本时才抓得到。
+ */
+function editable(host, value, renderView, makeEditor) {
+  const view = el("div", "eb-view");
+  const edit = el("div", "eb-edit");
+  edit.hidden = true;
+  host.append(view, edit);
+  renderView(view, value);
+  function show() { edit.hidden = true; view.hidden = false; }
+  return {
+    show,
+    view,
+    toEdit() {
+      edit.textContent = "";
+      makeEditor(edit, value, v => {
+        value = v;
+        // 必须先清空再渲染：只读态的 renderView 一律是 append（它只被调用一次
+        // 时没问题），存完再调一次就会把旧内容留在上面——于是同一个 view 里
+        // 叠了两三段 .body-text，页面上看着像存了两次。
+        view.textContent = "";
+        renderView(view, v);
+        show();
+      });
+      view.hidden = true;
+      edit.hidden = false;
+    },
+  };
+}
+
+/* 两个保存按钮：主次分明。「取消」等价于保存原值——它只是切回只读，
+ * 不发请求，所以不会有"取消了一半写进账本"这种事。 */
+function editActions(saveFn, cancelFn) {
+  const bar = el("div", "eb-actions");
+  const save = el("button", "primary", "保存");
+  save.type = "button";
+  save.onclick = saveFn;
+  const cancel = el("button", "secondary", "取消");
+  cancel.type = "button";
+  cancel.onclick = cancelFn;
+  bar.append(save, cancel);
+  return bar;
+}
+
+/* ------------------------------------------------------------------ 时间线
+ *
+ * 原来是「时间 | actor | 文本」的三列网格加分隔线，读起来就是一张日志表。
+ * 现在做成活动流：左边一条竖线 + 一个点，主文本在上、时间与操作人在下。
+ *
+ * `edited` 的 message 是服务端拼的「修改了：body、tags」——**字段名裸露**，
+ * 这正是"像调试模式"的另一半原因。服务端那边是 API 契约不能改中文，所以
+ * 翻译放在显示层（FIELD_CN 与 panel.py 的 FIELD_LABEL 同一套词）。
+ */
+const FIELD_CN = {
+  title: "标题", body: "描述", tags: "标签", source: "来源",
+  blocked_note: "阻塞备注", position: "排序位置",
+  project_dir: "项目主文件夹", agent_session: "agent 对话名",
+};
+
+function prettyEdited(msg) {
+  const m = /^修改了：(.*)$/.exec(msg || "");
+  if (!m) return "改了内容";
+  const names = m[1].split("、").map(x => FIELD_CN[x] || x);
+  return "改了" + names.join("、");
+}
+
+function statusChip(key) {
+  if (!key) return el("span", "chip chip-none", "—");
+  return el("span", "chip chip-" + key, STATUS_LABEL[key] || key);
+}
+
+function eventLine(e) {
+  const li = el("li", "tl-item tl-" + e.kind);
+  li.append(el("span", "tl-dot"));
+  const main = el("div", "tl-main");
+  const line = el("div", "tl-line");
+  if (e.kind === "status") {
+    line.append(statusChip(e.from_status), el("span", "tl-arrow", "→"),
+                statusChip(e.to_status));
+    if (e.message) line.append(el("span", "tl-note", e.message));
+  } else if (e.kind === "created") {
+    line.append(el("span", "tl-what", "创建了这张卡"));
+  } else if (e.kind === "edited") {
+    line.append(el("span", "tl-what", prettyEdited(e.message)));
+  } else {
+    line.append(el("span", "tl-what",
+      (KIND_LABEL[e.kind] || e.kind) + (e.message ? "：" + e.message : "")));
+  }
+  main.append(line, el("div", "tl-meta",
+    fmtTime(e.created_at) + " · " + (ACTOR_LABEL[e.actor] || e.actor)));
+  li.append(main);
+  return li;
+}
+
 function drawDrawer(id, idea) {
   const body = document.getElementById("drawer-body");
   body.textContent = "";
@@ -322,74 +446,151 @@ function drawDrawer(id, idea) {
   body.append(el("h2", "drawer-title", idea.title));
   const sub = el("div", "drawer-sub");
   sub.append(el("span", "drawer-id", "#" + idea.id));
-  sub.append(el("span", "drawer-status", STATUS_LABEL[idea.status] || idea.status));
+  sub.append(el("span", "drawer-status chip-" + idea.status,
+                STATUS_LABEL[idea.status] || idea.status));
   if (idea.source) sub.append(el("span", "drawer-source", idea.source));
   body.append(sub);
 
-  /* 描述：从只读 <div> 换成可编辑 <textarea>（最少 3 行、随内容增高）。
-   * 原来只能看不能改——描述是账本里最该随手补充的字段，却只能靠 CLI 写。
-   * 自动增高用 scrollHeight：先把 height 归 auto 才能量到真实内容高。 */
-  body.append(el("h3", "sec-h", "描述"));
-  const bd = el("textarea", "drawer-body-edit");
-  bd.rows = 3;
-  bd.value = idea.body || "";
-  bd.placeholder = "为什么想做、给谁看、要什么效果";
-  const autoGrow = () => {
-    bd.style.height = "auto";
-    bd.style.height = bd.scrollHeight + "px";
+  /* --- 描述 ---------------------------------------------------------------- */
+  const descBtn = miniBtn("编辑", "改描述");
+  const desc = editable(section(body, "描述", descBtn), idea.body || "",
+    (view, v) => {
+      if (v) view.append(el("div", "body-text", v));
+      else view.append(el("p", "field-empty", "还没写描述。点「编辑」补上。"));
+    },
+    (host, value, done) => {
+      const ta = el("textarea", "drawer-body-edit");
+      ta.rows = 3;
+      ta.value = value;
+      ta.placeholder = "为什么想做、给谁看、要什么效果";
+      // 自动增高：先归 auto 才量得到真实内容高，否则只会越加越长。
+      const grow = () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; };
+      ta.addEventListener("input", grow);
+      grow();
+      const bar = editActions(async () => {
+        const s = bar.querySelector(".primary");
+        s.disabled = true;
+        try {
+          const got = await api("PATCH", "/api/ideas/" + id, { body: ta.value });
+          drawerMsg("描述已保存", "ok");
+          await load();
+          done(got.body == null ? "" : got.body);
+        } catch (e) { s.disabled = false; drawerMsg(e.message, "bad"); }
+      }, () => done(value));
+      host.append(ta, bar);
+      ta.focus();
+    });
+  descBtn.onclick = () => desc.toEdit();
+
+  /* --- 标签 ---------------------------------------------------------------- */
+  const tagBtn = miniBtn("编辑", "改标签");
+  const tagView = el("div", "chip-row");
+  const renderTags = v => {
+    tagView.textContent = "";
+    const list = String(v || "").split(",").filter(Boolean);
+    if (!list.length) tagView.append(el("span", "field-empty", "没有标签"));
+    else list.forEach(t => tagView.append(el("span", "chip", t)));
   };
-  bd.addEventListener("input", autoGrow);
-  autoGrow();                             // 打开时就按已有内容定高
-  body.append(bd);
-  const bdSave = el("button", "secondary desc-save", "保存描述");
-  bdSave.onclick = () => saveField(id, "body", bd, "描述", bdSave);
-  body.append(bdSave);
+  renderTags(idea.tags);
+  section(body, "标签", tagBtn).append(tagView);
+  tagBtn.onclick = () => {
+    const host = el("div", "eb-edit");
+    tagView.replaceWith(host);
+    const inp = el("input", "eb-input");
+    inp.value = String(idea.tags || "").split(",").filter(Boolean).join(",");
+    inp.placeholder = "逗号分隔，留空即无标签";
+    const bar = editActions(async () => {
+      const s = bar.querySelector(".primary");
+      s.disabled = true;
+      try {
+        const got = await api("PATCH", "/api/ideas/" + id, { tags: inp.value });
+        drawerMsg("标签已保存", "ok");
+        await load();
+        renderTags(got.tags);
+        host.replaceWith(tagView);
+      } catch (e) { s.disabled = false; drawerMsg(e.message, "bad"); }
+    }, () => host.replaceWith(tagView));
+    host.append(inp, bar);
+    inp.focus();
+  };
 
-  /* 项目：主文件夹 + agent 对话名。两个都是 PATCH 的独立字段，各配一个保存按钮——
-   * 共用一个「保存项目」会让人不确定到底存了哪个。传空串即清空（传 null 是 422）。 */
-  body.append(el("h3", "sec-h", "项目"));
-  projectRow(body, id, "project_dir", idea.project_dir || "", "项目主文件夹", "D:\\coding\\我的作品");
-  projectRow(body, id, "agent_session", idea.agent_session || "", "agent 对话名", "与 agent 的对话名");
+  /* --- 项目：两个字段一次存 --------------------------------------------------
+   * 共用一个保存按钮而不是各配一个：它们本来就是一件事（这件作品在哪、哪次对话
+   * 在推），一次 PATCH 只写一条 edited event，比分两次存多一条流水干净。 */
+  const projBtn = miniBtn("编辑", "改项目文件夹与对话名");
+  const projView = el("div", "proj-view");
+  const PROJ_FIELDS = [
+    ["project_dir", "项目主文件夹", "D:\\coding\\我的作品", true],
+    ["agent_session", "agent 对话名", "与 agent 的对话名", false],
+  ];
+  const renderProj = vals => {
+    projView.textContent = "";
+    PROJ_FIELDS.forEach(([key, label, , mono]) => {
+      const v = vals[key] || "";
+      const row = el("div", "proj-item");
+      row.append(el("span", "proj-label", label));
+      row.append(v ? el("span", "proj-value" + (mono ? " is-mono" : ""), v)
+                   : el("span", "proj-value is-empty", "未填写"));
+      projView.append(row);
+    });
+  };
+  renderProj(idea);
+  section(body, "项目", projBtn).append(projView);
+  projBtn.onclick = () => {
+    const host = el("div", "eb-edit");
+    projView.replaceWith(host);
+    const inputs = {};
+    PROJ_FIELDS.forEach(([key, label, ph]) => {
+      const row = el("label", "proj-row");
+      row.append(el("span", "proj-label", label));
+      const inp = el("input", "proj-input");
+      inp.value = idea[key] || "";
+      inp.placeholder = ph;
+      inp.autocomplete = "off";
+      inputs[key] = inp;
+      row.append(inp);
+      host.append(row);
+    });
+    const bar = editActions(async () => {
+      const s = bar.querySelector(".primary");
+      s.disabled = true;
+      try {
+        // 清空靠传空串：传 null 服务端 422（"… 不能为 null，请传空串"）。
+        const payload = {};
+        Object.keys(inputs).forEach(k => { payload[k] = inputs[k].value; });
+        const got = await api("PATCH", "/api/ideas/" + id, payload);
+        drawerMsg("项目信息已保存", "ok");
+        await load();
+        renderProj(got);
+        host.replaceWith(projView);
+      } catch (e) { s.disabled = false; drawerMsg(e.message, "bad"); }
+    }, () => host.replaceWith(projView));
+    host.append(bar);
+    inputs.project_dir.focus();
+  };
 
-  /* 项目文档：清单 + 按需预览 + 挂载/移除。清单直接用 idea.docs（详情里一次带全），
-   * 不为「打开抽屉」再打一次 /docs。 */
-  body.append(el("h3", "sec-h", "项目文档"));
+  /* --- 项目文档 ------------------------------------------------------------- */
+  const addBtn = miniBtn("＋ 挂载", "挂一篇文档");
+  const docsSlot = section(body, "项目文档", addBtn);
   syncDocs(id, idea.docs);
   const docsHost = el("div", "docs-host");
   docsHost.id = "docs-host";
-  body.append(docsHost);
-  drawDocs(docsHost, id);
-
-  /* 标签编辑：整串编辑比逐个加删省事，也避免"最后剩一个标签时删不掉"这种
-   * 半吊子交互。PATCH tags 传逗号串，服务端统一规范化（SPEC 4.2）。 */
-  body.append(el("h3", "sec-h", "标签"));
-  const tagForm = el("div", "tag-form");
-  const tagInput = el("input", "tag-input");
-  tagInput.type = "text";
-  tagInput.placeholder = "逗号分隔，留空即无标签";
-  tagInput.value = idea.tags.split(",").filter(Boolean).join(",");
-  const tagSave = el("button", "secondary", "保存标签");
-  tagSave.onclick = async () => {
-    tagSave.disabled = true;
-    try {
-      const got = await api("PATCH", "/api/ideas/" + id, { tags: tagInput.value });
-      tagInput.value = got.tags.split(",").filter(Boolean).join(",");
-      drawerMsg("");
-      await load();                       // 下拉的标签全集跟着更新
-      drawDrawer(id, got);
-    } catch (e) {
-      drawerMsg(e.message, "bad");        // 例如"标签不能为空"
-    } finally {
-      tagSave.disabled = false;
+  docsSlot.append(docsHost);
+  drawDocs(docsHost, id, true, false);  // 挂载表单默认收起：只读态不该摆两个空输入框
+  let addForm = null;
+  addBtn.onclick = () => {
+    if (addForm) {                       // 再点一次 = 收起
+      addForm.remove();
+      addForm = null;
+      return;
     }
+    addForm = el("div");
+    docsHost.append(addForm);           // drawDocs 重绘 host 时它会被清掉，重新点即可
+    drawDocs(addForm, id, false, true);
   };
-  tagForm.append(tagInput, tagSave);
-  body.append(tagForm);
 
-  /* 推进：目标状态选择器 + **可填可不填**的备注框。
-   * 备注框不是装饰——人手操作同样要能补一句，否则 human 路径写出的
-   * events 全是空 message，时间线会很难读（SPEC 8.5）。 */
-  body.append(el("h3", "sec-h", "推进"));
+  /* --- 动作：推进 ------------------------------------------------------------ */
+  const actSlot = section(body, "推进");
   const form = el("div", "advance-form");
   const sel = el("select", "advance-sel");
   STATUS_ORDER.forEach(s => sel.append(new Option(STATUS_LABEL[s], s, false, s === idea.status)));
@@ -418,10 +619,10 @@ function drawDrawer(id, idea) {
     }
   };
   form.append(sel, note, go);
-  body.append(form);
+  actSlot.append(form);
 
-  /* 阻塞按钮。注意请求体字段：block 收 {reason}，不是 note（SPEC 5.6）。 */
-  body.append(el("h3", "sec-h", "阻塞"));
+  /* --- 动作：阻塞 ------------------------------------------------------------ */
+  const blockSlot = section(body, "阻塞");
   const blockForm = el("div", "block-form");
   const reasonInput = el("input", "block-input");
   reasonInput.id = "block-reason";
@@ -456,76 +657,19 @@ function drawDrawer(id, idea) {
       bBtn.disabled = false;
     }
   };
-  body.append(blockForm);
+  blockSlot.append(blockForm);
   // 5.6：blocked_note 只是当前快照，只在真的卡住时渲染，
   // 否则会出现"没卡住却挂着旧原因"的错觉
   if (idea.blocked) {
-    body.append(el("p", "blocked-note", "卡住原因：" + (idea.blocked_note || "（没写）")));
+    blockSlot.append(el("p", "blocked-note", "卡住原因：" + (idea.blocked_note || "（没写）")));
   }
 
-  body.append(el("h3", "sec-h", "时间线"));
+  /* --- 时间线 --------------------------------------------------------------- */
+  const tlSlot = section(body, "时间线");
   const tl = el("ol", "timeline");
-  (idea.events || []).forEach(e => {
-    const li = el("li", "tl-item");
-    li.append(el("span", "ev-when", fmtTime(e.created_at)));
-    li.append(el("span", "ev-actor", ACTOR_LABEL[e.actor] || e.actor));
-    const txt = el("span", "ev-text");
-    let s;
-    if (e.kind === "status") {
-      s = (STATUS_LABEL[e.from_status] || e.from_status || "?") + " → "
-        + (STATUS_LABEL[e.to_status] || e.to_status || "?");
-      if (e.message) s += "　" + e.message;
-    } else {
-      const k = KIND_LABEL[e.kind] || e.kind;
-      s = k + (e.message ? "：" + e.message : "");
-    }
-    txt.textContent = s;
-    li.append(txt);
-    tl.append(li);
-  });
+  (idea.events || []).forEach(e => tl.append(eventLine(e)));
   if (!(idea.events || []).length) tl.append(el("li", "tl-empty", "还没有记录"));
-  body.append(tl);
-}
-
-/* ------------------------------------------------------------ 字段保存（描述/项目）
- *
- * 三个字段（body / project_dir / agent_session）都是 PATCH 的白名单字段，
- * 语义一样，抽成一个函数。清空靠传空串：传 null 服务端会 422
- * （「项目主文件夹 不能为 null，请传空串」），所以这里永远传字符串。
- *
- * **保存后不重绘抽屉**：重绘会把其它输入框里还没保存的字冲掉——用户先填好
- * 主文件夹和对话名、再点第一个「保存」，第二个框里的字就没了。只回填自己那一个
- * 输入框（服务端会规范化，比如去掉首尾空白），看板刷一次即可。
- */
-async function saveField(id, key, input, label, btn) {
-  btn.disabled = true;
-  try {
-    const got = await api("PATCH", "/api/ideas/" + id, { [key]: input.value });
-    input.value = got[key] == null ? "" : got[key];
-    await load();                         // 看板跟着更新
-    drawerMsg(label + "已保存", "ok");
-  } catch (e) {
-    drawerMsg(e.message, "bad");
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-function projectRow(parent, id, key, value, label, placeholder) {
-  const row = el("label", "proj-row");
-  row.append(el("span", "proj-label", label));
-  const line = el("div", "proj-line");
-  const input = el("input", "proj-input");
-  input.type = "text";
-  input.placeholder = placeholder;
-  input.value = value;
-  input.autocomplete = "off";
-  const btn = el("button", "secondary", "保存");
-  btn.type = "button";
-  btn.onclick = () => saveField(id, key, input, label, btn);
-  line.append(input, btn);
-  row.append(line);
-  parent.append(row);
+  tlSlot.append(tl);
 }
 
 /* ------------------------------------------------------------ 项目文档（SPEC 10）
@@ -550,7 +694,7 @@ async function refreshDocs(ideaId, host) {
   const r = await api("GET", "/api/ideas/" + ideaId + "/docs");
   syncDocs(ideaId, r.docs);
   await load();                           // 看板卡片的文档角标
-  if (state.openId === ideaId && host) drawDocs(host, ideaId);
+  if (state.openId === ideaId && host) drawDocs(host, ideaId, true, false);
 }
 
 /* 字节数 -> 人话。与 CLI 同一套口径（KB 保留一位、不到 1 KB 直接给字节）。 */
@@ -564,11 +708,11 @@ function fmtSize(n) {
 async function openDoc(ideaId, docId, host) {
   if (docsState.open === docId) {         // 再点一次 = 收起
     docsState.open = null;
-    drawDocs(host, ideaId);
+    drawDocs(host, ideaId, true, false);
     return;
   }
   docsState.open = docId;
-  drawDocs(host, ideaId);                 // 先把「读取中…」画出来
+  drawDocs(host, ideaId, true, false);   // 先把「读取中…」画出来
   let c = docsState.cache[docId];
   if (!c) {
     try {
@@ -581,7 +725,7 @@ async function openDoc(ideaId, docId, host) {
       docsState.cache[docId] = c;
     }
   }
-  if (state.openId === ideaId && docsState.open === docId) drawDocs(host, ideaId);
+  if (state.openId === ideaId && docsState.open === docId) drawDocs(host, ideaId, true, false);
 }
 
 function docPreview(doc) {
@@ -605,10 +749,15 @@ function docPreview(doc) {
   return box;
 }
 
-function drawDocs(host, ideaId) {
+/* 清单与挂载表单分开渲染：只读态不该在清单下面常年摆两个空输入框。
+ * withList / withForm 决定画哪一半；表单增删成功后只重画清单那份 host，
+ * 否则会把用户正填的路径连同表单一起冲掉。 */
+function drawDocs(host, ideaId, withList, withForm) {
   host.textContent = "";
   const docs = docsState.docs || [];
 
+  if (withList !== false) {
+  docsState.host = host;
   const list = el("div", "doc-list");
   if (!docs.length) {
     list.append(el("p", "doc-empty", "还没挂文档。把 SPEC 或 README 的路径挂上来，随时在这里看。"));
@@ -650,7 +799,9 @@ function drawDocs(host, ideaId) {
     list.append(item);
   });
   host.append(list);
+  } // withList
 
+  if (withForm === true) {
   const form = el("div", "doc-add");
   const pIn = el("input", "doc-add-path");
   pIn.type = "text";
@@ -674,7 +825,8 @@ function drawDocs(host, ideaId) {
       pIn.value = "";
       tIn.value = "";
       drawerMsg("");
-      await refreshDocs(ideaId, host);
+      // 重画**清单**那一份，不重画自己：否则刚清空的表单连同刚成功的提示一起没了
+      await refreshDocs(ideaId, docsState.host);
       drawerMsg("已挂载「" + (t || p) + "」", "ok");
     } catch (e) {
       drawerMsg(e.message, "bad");       // 例如「这份文档已经挂在这张卡上了」
@@ -683,6 +835,7 @@ function drawDocs(host, ideaId) {
   };
   form.append(pIn, tIn, add);
   host.append(form);
+  } // withForm
 }
 
 /* ------------------------------------------------------------ markdown 渲染器
@@ -882,6 +1035,23 @@ function mdToHtml(src) {
 function closeDrawer() {
   document.getElementById("drawer").hidden = true;
   state.openId = null;
+  setDrawerFull(false);         // 关掉之前把全屏态复位，否则下次打开是全屏的
+}
+
+/* 抽屉全屏（用户 2026-10-13：「首先应该可以展开到全屏」）。
+ * 读长文档时 27rem 的窄栏要来回横竖滚，全屏才有正常的阅读宽度。 */
+function setDrawerFull(on) {
+  const d = document.getElementById("drawer");
+  d.classList.toggle("is-full", !!on);
+  const b = document.getElementById("drawer-full");
+  const label = on ? "退出全屏" : "展开到全屏";
+  b.textContent = on ? "⤡" : "⤢";
+  b.setAttribute("aria-label", label);
+  b.title = label;
+}
+
+function isDrawerFull() {
+  return document.getElementById("drawer").classList.contains("is-full");
 }
 
 /* ------------------------------------------------------------ 拖拽（SPEC 8.5）
@@ -1077,7 +1247,7 @@ Object.assign(window, {
   positionFor, quickNew, fmtTime,
   // 本任务新增：Playwright/控制台断言要能直接够到渲染器与文档区块
   mdToHtml, escHtml, isSafeUrl, renderMdBlocks, fmtSize,
-  drawDocs, openDoc, refreshDocs, saveField, docsState
+  drawDocs, openDoc, refreshDocs, docsState
 });
 
 let qTimer = null;
@@ -1090,5 +1260,19 @@ document.getElementById("tag").onchange = e => { state.filter.tag = e.target.val
 document.getElementById("only-blocked").onchange = e => { state.filter.blocked = e.target.checked; reload(); };
 document.getElementById("new-btn").onclick = () => quickNew();
 document.getElementById("drawer-close").onclick = () => closeDrawer();
+document.getElementById("drawer-full").onclick = () => setDrawerFull(!isDrawerFull());
+
+// Esc：全屏时先退出全屏，再按一次才关抽屉。直接一步关掉会让"我只是想看大图"
+// 变成丢上下文。记一个想法的 <dialog> 自己吃 Esc，别抢它的。
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  const dialog = document.getElementById("composer");
+  if (dialog && dialog.open) return;
+  const d = document.getElementById("drawer");
+  if (d.hidden) return;
+  e.preventDefault();
+  if (isDrawerFull()) setDrawerFull(false);
+  else closeDrawer();
+});
 
 reload();

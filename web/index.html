@@ -50,7 +50,12 @@
   <!-- 抽屉：Task 7 填充内容。本任务只保证它开局是关着的。 -->
   <aside class="drawer" id="drawer" hidden>
     <div class="drawer-inner">
-      <button class="drawer-close" id="drawer-close" type="button" aria-label="关闭">✕</button>
+      <div class="drawer-bar">
+        <button class="drawer-icon" id="drawer-full" type="button"
+                aria-label="展开到全屏" title="展开到全屏">⤢</button>
+        <button class="drawer-icon" id="drawer-close" type="button"
+                aria-label="关闭" title="关闭（Esc）">✕</button>
+      </div>
       <div id="drawer-body"></div>
     </div>
   </aside>
