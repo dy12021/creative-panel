@@ -107,6 +107,24 @@ def validation_message(exc: RequestValidationError) -> str:
     return "；".join(msgs) or "请求参数不合法"
 
 
+class _NoStoreStatic(StaticFiles):
+    """静态资源一律禁缓存。
+
+    这是"改源码 -> 刷新看"的本地工具，浏览器一旦缓存过 style.css / app.js，
+    就会一直渲染旧界面，而 /api 的数据照旧是新的——症状是"壳是旧的、数据是
+    新的"，看上去像代码没改成功，其实代码早就改了。所以直接掐掉缓存：刷新
+    必须等于当前代码。
+
+    Starlette 的 file_response 已经处理了 ETag / Last-Modified 与 304，这里
+    只补响应头，不碰它的匹配逻辑；用 *args 转发是为了不绑死 Starlette 的签名。
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return response
+
+
 def create_app():
     db.init_db()
     app = FastAPI(title="创意面板", version=VERSION)
@@ -216,7 +234,7 @@ def create_app():
     # web/ 由 Task 5 创建；目录不存在时 StaticFiles 会当场抛错，所以先判
     # 存在再挂。挂在最后——Starlette 按注册顺序匹配，路由在前，不会被盖住。
     if WEB_DIR.exists():
-        app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+        app.mount("/", _NoStoreStatic(directory=str(WEB_DIR), html=True), name="web")
     return app
 
 

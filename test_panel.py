@@ -1090,6 +1090,30 @@ def test_web_dir_mount_does_not_shadow_api(tmp_path, monkeypatch):
     assert c.get("/api/stats").status_code == 200
 
 
+def test_static_responses_are_no_store(tmp_path, monkeypatch):
+    """静态资源必须带 no-store。
+
+    2026-10-13 实测踩过：改完亮色主题和横向轨道，磁盘与 HTTP 都已是新文件，
+    用户浏览器里却还是旧的暗色界面——它缓存着重做之前的 style.css / app.js。
+    而 app.js 是旧版也照样能跑、/api 数据照旧是新的，于是症状变成"壳是旧的、
+    数据是新的"，看起来像代码根本没改成功，非常难自查。
+
+    这里锁的是响应头本身。断言写成"含 no-store"而不是全等，是为了允许以后
+    往里加 max-age 之类的指令；但去掉 no-store 会让这条测试变红。
+    """
+    appm = importlib.import_module("app")
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "s.db"))
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "index.html").write_text("<h1>面板</h1>", encoding="utf-8")
+    (web / "style.css").write_text(":root{--bg:#EDF0F4}", encoding="utf-8")
+    monkeypatch.setattr(appm, "WEB_DIR", web)
+    c = TestClient(appm.create_app())
+    for path in ("/", "/style.css"):
+        cc = c.get(path).headers.get("cache-control", "")
+        assert "no-store" in cc, "%s 少了 no-store：%r" % (path, cc)
+
+
 # --- 修复轮 1：detail 契约统一 + 筛选参数空串归一 ---------------------------
 # 上一轮两种 detail 形态混在同一个 {"detail": ...} 字段下：store 的 Invalid 是
 # 字符串，pydantic 的框架层错误是数组。CLI 直接 r.json()["detail"] 打印、
