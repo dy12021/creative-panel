@@ -1,7 +1,14 @@
 """数据访问层。纯数据操作，不感知 HTTP。
 
 设计依据 SPEC 第 5 节。异常：NotFound / Invalid（Invalid 带人话 detail）。
+
+一处例外：read_doc / list_docs 会读盘。这是刻意的——项目文档只存路径，
+面板按需读最新内容（SPEC 10.1），所以"文档在外面改了"能立刻反映到面板上，
+而不是把一份会过期的副本塞进库里。
 """
+import os
+from pathlib import Path
+
 import db
 
 
@@ -15,7 +22,16 @@ class Invalid(Exception):
         self.detail = detail
 
 
-FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
+FIELDS = ("title", "body", "tags", "source", "blocked_note", "position",
+          "project_dir", "agent_session")
+
+# 允许挂载的文档后缀。挡住"把面板当任意文件读取器用"——面板只需要看文档，
+# 不需要看 .env / .db / 密钥之类的文件。这不是安全边界（面板绑 127.0.0.1，
+# 本地进程都打得进来），是防止误挂。
+DOC_EXTS = (".md", ".markdown", ".mdx", ".txt")
+# 单篇预览上限。超出只截断并置 truncated，不报错——大文档不该让面板打不开。
+DOC_MAX_BYTES = 512 * 1024
+
 
 # SPEC 4.2 的浮点耗尽阈值。落点与同列相邻卡片的 position 差值**严格小于**它就触发整列
 # 重排（措辞与 SPEC 一致：不是小于等于）。
@@ -27,7 +43,8 @@ _PENDING_ID = 1 << 62
 
 
 _FIELD_LABEL = {"title": "标题", "body": "描述", "source": "来源",
-                "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置"}
+                "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置",
+                "project_dir": "项目主文件夹", "agent_session": "agent 对话名"}
 
 
 def _text(v, what):
@@ -71,6 +88,151 @@ def _parse_tags(raw):
         raise Invalid(str(e))
     except (TypeError, AttributeError):
         raise Invalid("标签必须是逗号分隔的字符串")
+
+
+def _need_idea(c, idea_id):
+    """卡片不存在时抛 NotFound——所有按 idea_id 写的路径共用这一个守卫。"""
+    if not c.execute("SELECT 1 FROM ideas WHERE id=?", (idea_id,)).fetchone():
+        raise NotFound("没有 #%s 这条创意" % idea_id)
+
+
+# --- 项目文档（SPEC 10.1）-------------------------------------------------
+# 库里只有路径。内容在读的时候现读现给，所以面板看到的一直是磁盘上的最新版本。
+
+
+def _doc_path(raw):
+    """校验并归一化待挂载的文档路径，返回绝对路径的 Path。
+
+    相对路径按**当前工作目录**解析（CLI 与 start.bat 都从项目根启动，所以
+    `docs/spec.md` 落在项目根下）。不用 Path.cwd() 之外的锚点是因为这层不该
+    猜用户以为的"相对谁"。
+    """
+    raw = _text(raw, "文档路径").strip()
+    if not raw:
+        raise Invalid("文档路径不能为空")
+    p = Path(raw).expanduser()
+    if p.suffix.lower() not in DOC_EXTS:
+        raise Invalid("只能挂 markdown 或 txt 文档（%s）" % "、".join(DOC_EXTS))
+    return p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
+
+
+def _stat_doc(p):
+    """文件当前状态。stat 失败一律当"不在了"，不抛——文档可能被人在外面删掉。"""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return {"exists": False, "size": None, "modified_at": None}
+    if not os.path.isfile(p):
+        return {"exists": False, "size": None, "modified_at": None}
+    return {"exists": True, "size": st.st_size,
+            "modified_at": db.iso_from_timestamp(st.st_mtime)}
+
+
+def _doc_row(r):
+    d = {"id": r["id"], "idea_id": r["idea_id"], "path": r["path"],
+         "title": r["title"], "position": r["position"], "created_at": r["created_at"]}
+    d.update(_stat_doc(Path(r["path"])))
+    return d
+
+
+def _decode(raw):
+    """按 utf-8 -> gbk -> utf-8 替换的顺序试解码。
+
+    本机的文档不一定是 UTF-8，直接 decode("utf-8") 会在中文 GBK 文档上抛
+    UnicodeDecodeError 变成 500；宁可给出带替换符的文本，也不要整个面板挂掉。
+    """
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _read_text(p):
+    raw = p.read_bytes()[:DOC_MAX_BYTES + 1]
+    truncated = len(raw) > DOC_MAX_BYTES
+    return _decode(raw[:DOC_MAX_BYTES] if truncated else raw), truncated
+
+
+def list_docs(idea_id):
+    c = db.connect()
+    try:
+        _need_idea(c, idea_id)
+        return [_doc_row(r) for r in c.execute(
+            "SELECT * FROM idea_docs WHERE idea_id=? ORDER BY position, id", (idea_id,))]
+    finally:
+        c.close()
+
+
+def add_doc(idea_id, path, title="", actor="human"):
+    p = _doc_path(path)
+    title = _text(title, "文档标题").strip() or p.stem
+    c = db.connect()
+    try:
+        _need_idea(c, idea_id)
+        # 判重按归一化后的绝对路径：同一份文档用 "docs/a.md" 和它的绝对路径
+        # 挂两次是同一个意思，路径形态不同不能当成两篇。
+        if c.execute("SELECT 1 FROM idea_docs WHERE idea_id=? AND path=?",
+                     (idea_id, str(p))).fetchone():
+            raise Invalid("这份文档已经挂在这张卡上了")
+        pos = c.execute(
+            "SELECT COALESCE(MAX(position),0)+1 FROM idea_docs WHERE idea_id=?",
+            (idea_id,)).fetchone()[0]
+        cur = c.execute(
+            "INSERT INTO idea_docs(idea_id,path,title,position,created_at)"
+            " VALUES(?,?,?,?,?)", (idea_id, str(p), title, pos, db.now_iso()))
+        # 复用 edited 事件而不是新增 kind：events.kind 有 CHECK 约束，加 kind
+        # 得整表重建（连带 id 与外键），为一条时间线文案不值得。message 说清
+        # 了实际发生了什么。
+        add_event(c, idea_id, "edited", actor, "挂载文档：%s" % title)
+        c.commit()
+        doc_id = cur.lastrowid
+    finally:
+        c.close()
+    c = db.connect()
+    try:
+        return _doc_row(c.execute("SELECT * FROM idea_docs WHERE id=?", (doc_id,)).fetchone())
+    finally:
+        c.close()
+
+
+def remove_doc(idea_id, doc_id, actor="human"):
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM idea_docs WHERE id=? AND idea_id=?",
+                        (doc_id, idea_id)).fetchone()
+        if not row:
+            raise NotFound("这张卡上没有 #%s 这份文档" % doc_id)
+        c.execute("DELETE FROM idea_docs WHERE id=?", (doc_id,))
+        add_event(c, idea_id, "edited", actor, "移除文档：%s" % row["title"])
+        c.commit()
+        return True
+    finally:
+        c.close()
+
+
+def read_doc(idea_id, doc_id):
+    """读一篇文档。记录不存在 -> NotFound；文件不见了 -> exists=False 但不报错。
+
+    这两种"不存在"必须分开：前者是调用方 id 写错了，该 404；后者是文档被人在
+    外面删了，面板该显示"文件已不在原处"并保留这条引用，等人回来处理。合在一
+    起会让第二种情况看起来像接口坏了。
+    """
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM idea_docs WHERE id=? AND idea_id=?",
+                        (doc_id, idea_id)).fetchone()
+        if not row:
+            raise NotFound("这张卡上没有 #%s 这份文档" % doc_id)
+        r = dict(row)
+    finally:
+        c.close()
+    d = _doc_row(r)
+    if not d["exists"]:
+        return dict(d, text="", truncated=False)
+    text, truncated = _read_text(Path(r["path"]))
+    return dict(d, text=text, truncated=truncated)
 
 
 def _board_order():
@@ -172,7 +334,8 @@ def _settle_position(c, status, pos, idea_id=None):
     return float(newpos[nxt["id"]] - 1)
 
 
-def create_idea(title, body="", tags=None, source="", actor="human", position=None):
+def create_idea(title, body="", tags=None, source="", actor="human", position=None,
+                project_dir="", agent_session=""):
     if title is None:              # null 视同"没给标题"，走 SPEC 错误表那条文案
         raise Invalid("标题不能为空")
     title = _text(title, "标题")   # 非字符串在这里挡，否则下面 .strip() 抛 AttributeError
@@ -180,6 +343,8 @@ def create_idea(title, body="", tags=None, source="", actor="human", position=No
         raise Invalid("标题不能为空")
     body = _text(body, "描述")
     source = _text(source, "来源")
+    project_dir = _text(project_dir, _FIELD_LABEL["project_dir"])
+    agent_session = _text(agent_session, _FIELD_LABEL["agent_session"])
     tags_v = _parse_tags(tags)
     if position is not None:
         position = _num(position, _FIELD_LABEL["position"])
@@ -192,9 +357,10 @@ def create_idea(title, body="", tags=None, source="", actor="human", position=No
                                 else position)
         ts = db.now_iso()
         cur = c.execute(
-            "INSERT INTO ideas(title,body,status,tags,source,position,created_at,updated_at)"
-            " VALUES(?,?,'idea',?,?,?,?,?)",
-            (title.strip(), body, tags_v, source, pos, ts, ts),
+            "INSERT INTO ideas(title,body,status,tags,source,project_dir,agent_session,"
+            "position,created_at,updated_at) VALUES(?,?,'idea',?,?,?,?,?,?,?)",
+            (title.strip(), body, tags_v, source, project_dir, agent_session,
+             pos, ts, ts),
         )
         add_event(c, cur.lastrowid, "created", actor, title.strip())
         c.commit()
@@ -228,7 +394,14 @@ def list_ideas(status=None, tag=None, q=None, blocked=None):
     args += case_args
     c = db.connect()
     try:
-        return [_row(c, r) for r in c.execute(sql, args)]
+        rows = [_row(c, r) for r in c.execute(sql, args)]
+        # docs_count 用一条 GROUP BY 批量取，不在循环里逐卡查——逐卡查是 N+1，
+        # 卡一多就线性变慢，而它只是卡片角标要的计数。
+        counts = {r["idea_id"]: r["n"] for r in c.execute(
+            "SELECT idea_id, COUNT(*) n FROM idea_docs GROUP BY idea_id")}
+        for d in rows:
+            d["docs_count"] = counts.get(d["id"], 0)
+        return rows
     finally:
         c.close()
 
@@ -242,6 +415,10 @@ def get_idea(idea_id):
         d = _row(c, r)
         d["events"] = [dict(e) for e in c.execute(
             "SELECT * FROM events WHERE idea_id=? ORDER BY id", (idea_id,))]
+        # 抽屉一次 GET 就要画全：事件、文档清单、字段都在这一份里，前端不用
+        # 为打开抽屉多打一发请求。
+        d["docs"] = [_doc_row(x) for x in c.execute(
+            "SELECT * FROM idea_docs WHERE idea_id=? ORDER BY position, id", (idea_id,))]
         return d
     finally:
         c.close()

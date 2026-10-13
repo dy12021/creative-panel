@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db          # noqa: E402
 import store       # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # 框架层 HTTP 错误的中文文案。未列出的状态码原样转字符串——宁可短，不要给
 # agent 一句"未知错误"却不说清是什么。
@@ -184,6 +184,8 @@ def create_app():
             body=body.get("body", ""),
             tags=body.get("tags"),
             source=body.get("source", ""),
+            project_dir=body.get("project_dir", ""),
+            agent_session=body.get("agent_session", ""),
             actor=resolve_actor(request))
 
     @app.get("/api/ideas/{idea_id}")
@@ -230,6 +232,33 @@ def create_app():
     @app.get("/api/stats")
     def stats():
         return store.stats()
+
+    # --- 项目文档（SPEC 10.1）---------------------------------------------
+    # 列表/内容分开两个端点：列表要能只花一次 stat 就能画出清单（每篇都带
+    # exists / size / modified_at），点开才去读正文。
+    @app.get("/api/ideas/{idea_id}/docs")
+    def docs(idea_id: int):
+        return {"docs": store.list_docs(idea_id)}
+
+    @app.post("/api/ideas/{idea_id}/docs", status_code=201)
+    def doc_add(idea_id: int, body: dict, request: Request):
+        # title 缺省空串，store 用文件名兜底；不写 body.get("title") or ""
+        # 是为了把 null 留给 store 报「文档标题 不能为 null」（SPEC 5.5 同一条
+        # "不报错的数据损坏比 500 更糟"）。
+        return store.add_doc(idea_id, body.get("path", ""),
+                             title=body.get("title", ""),
+                             actor=resolve_actor(request))
+
+    @app.get("/api/ideas/{idea_id}/docs/{doc_id}/content")
+    def doc_content(idea_id: int, doc_id: int):
+        # 文件被删掉时返回 200 + exists:false，不是 404：那不是接口坏了，
+        # 面板要据此显示"文件已不在原处"并保留引用（SPEC 10.2）。
+        return store.read_doc(idea_id, doc_id)
+
+    @app.delete("/api/ideas/{idea_id}/docs/{doc_id}")
+    def doc_del(idea_id: int, doc_id: int, request: Request):
+        store.remove_doc(idea_id, doc_id, actor=resolve_actor(request))
+        return {"ok": True}
 
     # web/ 由 Task 5 创建；目录不存在时 StaticFiles 会当场抛错，所以先判
     # 存在再挂。挂在最后——Starlette 按注册顺序匹配，路由在前，不会被盖住。

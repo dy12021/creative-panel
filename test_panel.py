@@ -37,6 +37,24 @@ def conn(tmp_path, monkeypatch):
     return db.connect()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_panel_db(tmp_path, monkeypatch):
+    """默认把每条测试的 PANEL_DB 指向临时文件。
+
+    这一层是补的，不是设计时就有的：新增的文档测试忘了设 env，于是直接打到
+    真实的 data/panel.db，报出 `table ideas has no column named project_dir`
+    ——真实库还没迁移，跟被测代码毫无关系。危害有两层：一条测试能污染用户
+    数据，而它的报错又会指向错误的方向。
+
+    所以隔离改成默认开启、不依赖每个测试自觉。真要测 db_path() 的缺省分支，
+    自己 monkeypatch.delenv("PANEL_DB", raising=False) 即可。
+
+    这里只 setenv、**不** init_db：有些测试断言"取时间戳不该在磁盘留下任何
+    东西"，替它们建库反而会让那条断言失效。需要表的测试照旧自己 init_db。
+    """
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "auto.db"))
+
+
 def test_pragmas(conn):
     """14. 建连后 PRAGMA 必须是安全值——recursive_triggers 是硬性前提。"""
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -340,8 +358,12 @@ def test_not_found(conn):
 # 却没有任何回归保护。补上，否则下一个人删掉任一条校验都不会变红。
 
 
+# ideas 表的列 + create 额外带的位置。docs / docs_count 不在这里：它们不是列
+# （docs 是每次现查的关联表，docs_count 只挂在列表响应上），放进这个集合会让
+# "create 不带 events/docs" 这条契约失去意义。
 IDEA_KEYS = {"id", "title", "body", "status", "blocked", "blocked_note",
-             "tags", "source", "position", "created_at", "updated_at", "done_at"}
+             "tags", "source", "position", "created_at", "updated_at", "done_at",
+             "project_dir", "agent_session"}
 
 
 @pytest.mark.parametrize("bad", [
@@ -394,12 +416,15 @@ def test_not_found_on_every_writer(conn):
 
 def test_returned_shape_is_stable(conn):
     """Task 3 依赖这个形状：返回 dict 的键必须齐全且可预测。"""
-    assert set(create_idea("x")) == IDEA_KEYS          # create 不带 events
+    assert set(create_idea("x")) == IDEA_KEYS          # create 不带 events/docs
     a = create_idea("y")
     for d in (get_idea(a["id"]), update_idea(a["id"], {"title": "z"}),
               advance(a["id"], "clarifying"), add_note(a["id"], "n"),
               block(a["id"], "r"), unblock(a["id"])):
-        assert set(d) == IDEA_KEYS | {"events"}
+        assert set(d) == IDEA_KEYS | {"events", "docs"}
+    # 列表那条多一个 docs_count（看板角标要用），且它**不是** ideas 表的列
+    row = list_ideas()[0]
+    assert set(row) == IDEA_KEYS | {"docs_count"}
 
 
 def test_stats_shape_has_all_five_columns(conn):
@@ -763,7 +788,7 @@ def _body_endpoints(i):
 def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "version": "0.1.0"}       # VERSION 是契约的一部分
+    assert r.json() == {"ok": True, "version": "0.2.0"}       # VERSION 是契约的一部分
 
 
 @pytest.mark.parametrize("payload", [["title"], "title", 5, True])
@@ -1085,7 +1110,7 @@ def test_web_dir_mount_does_not_shadow_api(tmp_path, monkeypatch):
     (web / "index.html").write_text("<h1>面板</h1>", encoding="utf-8")
     monkeypatch.setattr(appm, "WEB_DIR", web)
     c = TestClient(appm.create_app())
-    assert c.get("/api/health").json() == {"ok": True, "version": "0.1.0"}
+    assert c.get("/api/health").json() == {"ok": True, "version": "0.2.0"}
     assert "面板" in c.get("/").text
     assert c.get("/api/stats").status_code == 200
 
@@ -2259,3 +2284,284 @@ def test_cli_edit_field_type_on_the_success_path_is_checked(
     assert r.returncode == 1, r.stdout + r.stderr
     assert "类型不对" in r.stdout and "请确认 PANEL_URL 指向面板" in r.stdout
     assert "Traceback" not in r.stdout + r.stderr
+
+
+# --- 项目文档 / 项目主文件夹 / agent 对话名（SPEC 10）----------------------
+# 起因：一件作品的信息量远超"标题 + 一句话描述"。真正的上下文在文档里、在工作
+# 目录里、在那次对话里，面板要能指回去——但**只指**，不复制：库里的副本一定会
+# 和磁盘上的真文档对不上。
+
+_V1_SCHEMA = """
+CREATE TABLE ideas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'idea',
+  blocked INTEGER NOT NULL DEFAULT 0,
+  blocked_note TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT ',',
+  source TEXT NOT NULL DEFAULT '',
+  position REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  done_at TEXT,
+  CHECK (status IN ('idea','clarifying','clarified','building','done'))
+);
+"""
+
+
+def test_init_db_migrates_v1_library_without_losing_rows(tmp_path, monkeypatch):
+    """存量库必须原地长出新列，旧行一个不少。
+
+    ALTER TABLE ADD COLUMN 在 SQLite 里对已有行填的是 DEFAULT，所以老卡拿到的是
+    空串而不是 NULL——它们本来就是"没填项目文件夹"，空串才是对的语义。
+    """
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "old.db"))
+    c = sqlite3.connect(str(tmp_path / "old.db"))
+    c.executescript(_V1_SCHEMA)
+    c.execute("INSERT INTO ideas(title,created_at,updated_at) VALUES('老卡','t','t')")
+    c.commit()
+    c.close()
+
+    db.init_db()
+
+    c2 = db.connect()
+    try:
+        cols = {r["name"] for r in c2.execute("PRAGMA table_info(ideas)")}
+        assert {"project_dir", "agent_session"} <= cols
+        row = c2.execute("SELECT title, project_dir, agent_session FROM ideas").fetchone()
+        assert row["title"] == "老卡"
+        assert row["project_dir"] == "" and row["agent_session"] == ""
+        assert c2.execute("SELECT user_version FROM pragma_user_version").fetchone()[0] == 2
+    finally:
+        c2.close()
+
+
+def test_init_db_is_idempotent(tmp_path, monkeypatch):
+    """连跑两次不能炸。
+
+    判存在性靠 PRAGMA table_info 而不是 user_version，所以"版本号对不上但列已经
+    在了"的库也能起来——只信版本号会撞 duplicate column 而整个面板起不来。
+    """
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "twice.db"))
+    db.init_db()
+    db.init_db()
+    c = db.connect()
+    try:
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(ideas)")]
+        assert cols.count("project_dir") == 1
+    finally:
+        c.close()
+
+
+def test_project_fields_roundtrip_and_null_guard(conn):
+    i = create_idea("作品", project_dir="D:/coding/作品", agent_session="和 agent 聊分镜")
+    assert i["project_dir"] == "D:/coding/作品"
+    assert i["agent_session"] == "和 agent 聊分镜"
+    assert get_idea(i["id"])["agent_session"] == "和 agent 聊分镜"
+
+    updated = update_idea(i["id"], {"project_dir": "D:/coding/别处"})
+    assert updated["project_dir"] == "D:/coding/别处"
+    with pytest.raises(Invalid) as e:
+        update_idea(i["id"], {"project_dir": None})
+    assert "项目主文件夹" in str(e.value) and "不能为 null" in str(e.value)
+
+
+def test_doc_add_list_read_remove(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "d.db"))
+    db.init_db()
+    md = tmp_path / "分镜.md"
+    md.write_text("# 第一集\n\n开场。", encoding="utf-8")
+    i = create_idea("作品")
+    d = store.add_doc(i["id"], str(md))
+    assert d["title"] == "分镜"          # 标题缺省用文件名，不留空
+    assert d["exists"] is True
+    assert d["path"] == str(md.resolve())
+
+    lst = store.list_docs(i["id"])
+    assert [x["id"] for x in lst] == [d["id"]]
+    assert store.read_doc(i["id"], d["id"])["text"].startswith("# 第一集")
+
+    assert store.remove_doc(i["id"], d["id"]) is True
+    assert store.list_docs(i["id"]) == []
+
+
+def test_doc_rejects_non_document_extension(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "x.db"))
+    db.init_db()
+    """只放文档。挡住 .env / .db 之类不是因为这里构成安全边界（面板绑
+    127.0.0.1，本地进程都打得进来），是防止手滑把密钥文件挂进面板。"""
+    i = create_idea("作品")
+    bad = tmp_path / "secret.env"
+    bad.write_text("TOKEN=1", encoding="utf-8")
+    with pytest.raises(Invalid) as e:
+        store.add_doc(i["id"], str(bad))
+    assert "markdown" in str(e.value)
+    with pytest.raises(Invalid) as e2:
+        store.add_doc(i["id"], "   ")
+    assert "不能为空" in str(e2.value)
+
+
+def test_doc_duplicate_rejected_even_via_relative_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "q.db"))
+    db.init_db()
+    """判重按归一化后的绝对路径。
+
+    同一份文档写成绝对路径和相对路径是同一个意思，形态不同不能当成两篇——
+    否则清单里会出现两条一模一样的东西。"""
+    md = tmp_path / "spec.md"
+    md.write_text("x", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    i = create_idea("作品")
+    store.add_doc(i["id"], str(md))
+    with pytest.raises(Invalid) as e:
+        store.add_doc(i["id"], "spec.md")
+    assert "已经挂" in str(e.value)
+
+
+def test_missing_file_and_missing_record_are_different(tmp_path, monkeypatch):
+    """两种"不存在"必须分开：文档记录没有 -> NotFound；文件被删 -> exists=False。
+
+    合在一起的话，"文档被人删了"会显示成接口坏了，人会以为面板出错，而引用
+    其实还在、还能补回来。"""
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "g.db"))
+    db.init_db()
+    md = tmp_path / "gone.md"
+    md.write_text("临时", encoding="utf-8")
+    i = create_idea("作品")
+    d = store.add_doc(i["id"], str(md))
+    md.unlink()
+
+    got = store.read_doc(i["id"], d["id"])
+    assert got["exists"] is False and got["text"] == ""
+
+    with pytest.raises(NotFound):
+        store.read_doc(i["id"], 9999)
+    with pytest.raises(NotFound):
+        store.remove_doc(i["id"], 9999)
+
+
+def test_docs_cascade_on_idea_delete(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "z.db"))
+    db.init_db()
+    """删卡片必须连带删文档引用——靠 FK ON DELETE CASCADE，不靠手动清理。
+
+    留着孤儿行的话，AUTOINCREMENT 不回收 id，将来重建一张卡可能撞上旧文档
+    记录，而这种错不会报错，只会让新卡的文档莫名其妙多出来。"""
+    md = tmp_path / "a.md"
+    md.write_text("x", encoding="utf-8")
+    i = create_idea("作品")
+    store.add_doc(i["id"], str(md))
+    delete_idea(i["id"])
+    c = db.connect()
+    try:
+        assert c.execute("SELECT COUNT(*) FROM idea_docs").fetchone()[0] == 0
+    finally:
+        c.close()
+
+
+def test_doc_leaves_timeline_trace(tmp_path, monkeypatch):
+    """挂载/移除要留痕。复用 edited kind 而不是新增——events.kind 有 CHECK
+    约束，加 kind 得整表重建，为一条时间线文案不值得。"""
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "e.db"))
+    db.init_db()
+    md = tmp_path / "设定.md"
+    md.write_text("x", encoding="utf-8")
+    i = create_idea("作品")
+    d = store.add_doc(i["id"], str(md), actor="agent")
+    kinds = [(e["kind"], e["message"]) for e in get_idea(i["id"])["events"]]
+    assert ("edited", "挂载文档：%s" % d["title"]) in kinds
+    store.remove_doc(i["id"], d["id"], actor="agent")
+    kinds = [(e["kind"], e["message"]) for e in get_idea(i["id"])["events"]]
+    assert ("edited", "移除文档：%s" % d["title"]) in kinds
+
+
+def test_docs_count_on_list_is_not_n_plus_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "n.db"))
+    db.init_db()
+    md = tmp_path / "a.md"
+    md.write_text("x", encoding="utf-8")
+    a = create_idea("甲")
+    b = create_idea("乙")
+    store.add_doc(a["id"], str(md))
+    rows = {r["title"]: r for r in list_ideas()}
+    assert rows["甲"]["docs_count"] == 1
+    assert rows["乙"]["docs_count"] == 0
+
+
+def test_read_doc_truncates_and_survives_gbk(tmp_path, monkeypatch):
+    """大文档截断不报错；GBK 文档不 500。
+
+    直接 decode("utf-8") 会在 GBK 中文文档上抛 UnicodeDecodeError，整个抽屉打
+    不开——比给一段带替换符的文本糟糕得多。"""
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "r.db"))
+    db.init_db()
+    big = tmp_path / "big.md"
+    big.write_text("字" * (store.DOC_MAX_BYTES // 3 + 10), encoding="utf-8")
+    i = create_idea("作品")
+    d = store.add_doc(i["id"], str(big))
+    assert store.read_doc(i["id"], d["id"])["truncated"] is True
+
+    gbk = tmp_path / "gbk.md"
+    gbk.write_bytes("标题\n正文".encode("gbk"))
+    d2 = store.add_doc(i["id"], str(gbk))
+    assert "正文" in store.read_doc(i["id"], d2["id"])["text"]
+
+
+def test_doc_http_endpoints_and_static_route_not_shadowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "h.db"))
+    appm = importlib.import_module("app")
+    monkeypatch.setattr(appm, "WEB_DIR", Path(__file__).resolve().parent / "web")
+    c = TestClient(appm.create_app())
+
+    md = tmp_path / "手册.md"
+    md.write_text("# 手册", encoding="utf-8")
+    i = c.post("/api/ideas", json={"title": "作品"}).json()
+
+    r = c.post("/api/ideas/%d/docs" % i["id"], json={"path": str(md)})
+    assert r.status_code == 201
+    doc = r.json()
+    assert doc["title"] == "手册" and doc["exists"] is True
+
+    assert c.get("/api/ideas/%d/docs" % i["id"]).json()["docs"][0]["id"] == doc["id"]
+
+    body = c.get("/api/ideas/%d/docs/%d/content" % (i["id"], doc["id"]))
+    assert body.status_code == 200 and body.json()["text"] == "# 手册"
+
+    # 卡片不存在 -> 404，而不是 500
+    assert c.get("/api/ideas/999/docs").status_code == 404
+    # 文件没了 -> 200 + exists:false，不该是 404
+    md.unlink()
+    gone = c.get("/api/ideas/%d/docs/%d/content" % (i["id"], doc["id"]))
+    assert gone.status_code == 200 and gone.json()["exists"] is False
+
+    assert c.delete("/api/ideas/%d/docs/%d" % (i["id"], doc["id"])).status_code == 200
+    assert c.get("/api/ideas/%d/docs/%d/content" % (i["id"], doc["id"])).status_code == 404
+    # /api/* 没被挂在 "/" 的静态目录盖掉
+    assert c.get("/api/stats").status_code == 200
+
+
+def test_patch_project_fields_over_http(tmp_path, monkeypatch):
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "p.db"))
+    appm = importlib.import_module("app")
+    c = TestClient(appm.create_app())
+    i = c.post("/api/ideas", json={"title": "作品",
+                                   "project_dir": "D:/work",
+                                   "agent_session": "第 3 轮对话"}).json()
+    assert i["project_dir"] == "D:/work" and i["agent_session"] == "第 3 轮对话"
+    r = c.patch("/api/ideas/%d" % i["id"], json={"agent_session": "第 4 轮对话"})
+    assert r.json()["agent_session"] == "第 4 轮对话"
+    assert c.patch("/api/ideas/%d" % i["id"], json={"project_dir": None}).status_code == 422
+
+
+def test_get_idea_carries_docs_for_the_drawer(tmp_path, monkeypatch):
+    """抽屉一次 GET 就要画全，docs 必须在详情里——少一个字段前端就得为打开
+    抽屉多打一发请求，而那种"少打了一发也没事"的错最难发现。"""
+    monkeypatch.setenv("PANEL_DB", str(tmp_path / "d.db"))
+    db.init_db()
+    md = tmp_path / "x.md"
+    md.write_text("x", encoding="utf-8")
+    i = create_idea("作品")
+    store.add_doc(i["id"], str(md))
+    d = get_idea(i["id"])
+    assert isinstance(d["docs"], list) and len(d["docs"]) == 1

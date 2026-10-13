@@ -275,15 +275,65 @@ GET    /api/stats                         各态计数 + 阻塞数
 
 `DELETE /api/ideas/{id}` 通过外键级联删除其 `events`，不留孤儿。依赖 4.3 的 `ON DELETE CASCADE` 与 `PRAGMA foreign_keys=ON`。
 
+### 5.8 项目文档（2026-10-13 增补）
+
+**卡片引用的是文档的路径，不是文档的内容。** 这是整节的地基：库里存一份副本，
+就一定会和磁盘上的真文档对不上，而"面板上显示的是三个月前的版本"这种错没人看得出来。
+所以 `idea_docs` 只有 `path`，正文在 `.../content` 这个端点读的时候现读。
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /api/ideas/{id}/docs` | `{"docs":[…]}`，每条带 `exists` / `size` / `modified_at`（来自 `os.stat`） |
+| `POST /api/ideas/{id}/docs` | `{path, title?}` → **201**；`title` 省略时用文件名（去后缀） |
+| `GET /api/ideas/{id}/docs/{doc_id}/content` | 返回 `text` 与 `truncated` |
+| `DELETE /api/ideas/{id}/docs/{doc_id}` | 删引用，**不动磁盘上的文件** |
+
+契约要点：
+
+- **两种"不存在"必须分开**：文档记录没有 → **404**（调用方 id 写错了）；文件被人在
+  外面删了 → **200 且 `exists:false`**、`text` 为空串。合在一起的话，"文档被人删了"
+  会显示成接口坏了，而引用其实还在、还能补回来。
+- **只收 `.md` / `.markdown` / `.mdx` / `.txt`**。这不是安全边界（面板绑 `127.0.0.1`，
+  本地进程都打得进来），是防止手滑把 `.env`、密钥之类挂进面板。
+- **单篇上限 512 KB**，超出截断并置 `truncated:true`，**不报错**——大文档不该让抽屉打不开。
+- **解码顺序 utf-8 → gbk → utf-8/replace**。本机的文档不一定是 UTF-8，
+  直接 `decode("utf-8")` 会在 GBK 中文文档上抛 `UnicodeDecodeError` 变成 500；
+  宁可给一段带替换符的文本，也不要整个面板挂掉。
+- **判重按归一化后的绝对路径**：`docs/a.md` 与它的绝对路径是同一篇，挂两次报
+  「这份文档已经挂在这张卡上了」。否则清单里会出现两条一模一样的东西。
+- **相对路径按进程当前工作目录解析**，即 `start.bat` 的启动目录（项目根）。
+  所以 CLI 一律建议传绝对路径，并把归一化后的路径回显给调用方核对。
+- **挂载/移除复用 `edited` event**，不新增 `events.kind`。`kind` 有 `CHECK` 约束，
+  加一个 kind 要整表重建（连带 id 与外键），为一条时间线文案不值得。
+- `GET /api/ideas/{id}` 的返回**多一个 `docs` 数组**（抽屉一次 GET 就能画全）；
+  `GET /api/ideas` 的每条**多一个 `docs_count`**（看板角标要用，用一条 `GROUP BY` 批量取，
+  不做 N+1）。`docs_count` 不是 `ideas` 表的列，别混进列集合的断言里。
+
+### 5.9 项目主文件夹与 agent 对话名
+
+`ideas` 表新增两列，**走 PATCH 白名单**（`store.FIELDS`），语义与既有字段完全一致：
+传 `null` → 422，要清空就传 `""`。
+
+| 字段 | 记什么 |
+| --- | --- |
+| `project_dir` | 作品真正待着的工作目录（代码库、素材目录） |
+| `agent_session` | 这次 agent 对话的名字 |
+
+粒度是**每张卡各存各的**——一个创意对应一个目录、一次对话；不存在"面板当前项目"
+这种全局概念。若日后要默认值，做法是"卡片没填就回落到全局"，**不是**把全局值
+写进每张卡（后者会让"改全局"变成一次批量写，且没有 trace）。
+
 ## 6. panel.py CLI
 
 agent 的操作入口，是 REST API 的薄封装。输出给人看，不输出 JSON。
 
 ```bash
 python panel.py new "<标题>" [--body 描述] [--tags a,b] [--source 来源]
+                    [--project-dir <工作目录>] [--agent-session <对话名>]
 python panel.py list [--status <态>] [--tag <标签>] [--q <关键词>] [--blocked]
 python panel.py edit <id> [--title <标题>] [--body <描述>] [--tags a,b]
                     [--source <来源>] [--blocked-note <备注>] [--position <位次>]
+                    [--project-dir <工作目录>] [--agent-session <对话名>]
 python panel.py show <id>
 python panel.py advance <id> <状态> [--note "这步做了什么"]
 python panel.py note <id> "<消息>"
@@ -291,9 +341,17 @@ python panel.py block <id> "<卡住的原因>"
 python panel.py unblock <id>
 python panel.py stats
 python panel.py delete <id>
+python panel.py doc list <id>
+python panel.py doc add <id> "<路径.md>" [--title <标题>]
+python panel.py doc rm <id> <文档号>
+python panel.py doc show <id> <文档号>
 ```
 
-`edit` 打 `PATCH /api/ideas/{id}`，可改字段就是白名单那六个（见第 5 节），没有 `--status`——状态仍只能走 `advance`（5.1）。**没传的字段不进请求体**（PATCH 语义是"只有你传了的字段才改"），所以服务端那几个 422 分支（空对象、白名单外、null）在 CLI 上够不着——CLI 结构上发不出 JSON null，argparse 的一切都是文本。空对象只有 `edit <id>` 一个字段都不给时才会发生，服务端回「没有可更新的字段」，CLI 原样透传。`--body ""` 是**清空描述**，与不传是两件事：CLI 靠 argparse 的默认值（没传 = `None`，传空串 = `""`）区分，判据必须是 `is not None` 而不是真值判断。
+`edit` 打 `PATCH /api/ideas/{id}`，可改字段就是白名单那八个（见第 5 节），没有 `--status`——状态仍只能走 `advance`（5.1）。**没传的字段不进请求体**（PATCH 语义是"只有你传了的字段才改"），所以服务端那几个 422 分支（空对象、白名单外、null）在 CLI 上够不着——CLI 结构上发不出 JSON null，argparse 的一切都是文本。空对象只有 `edit <id>` 一个字段都不给时才会发生，服务端回「没有可更新的字段」，CLI 原样透传。`--body ""` 是**清空描述**，与不传是两件事：CLI 靠 argparse 的默认值（没传 = `None`，传空串 = `""`）区分，判据必须是 `is not None` 而不是真值判断。
+
+> **Windows / PowerShell 5.1 上清空字段要写 `--body=`（等号紧贴、后面什么都没有）**，不能写 `--body ""`：PS 5.1 会把空字符串参数整个吃掉，于是它变成"没给这个选项"，argparse 报 `expected one argument`。cmd 与 bash 不受影响。
+
+**`new` 的 `project_dir` / `agent_session` 同样走 `is not None` 判据**：不带这两个选项时 argparse 给的是 `None`，直接透传会让服务端的 null 守卫拒掉**整条请求**（新建直接失败），而这里本来只想表达"没填"。
 
 输出示例：
 
@@ -531,7 +589,8 @@ skill 源码放在项目里与代码一起版本控制。`install_skill.bat` 负
 以下明确排除，留到真正需要时再说：
 
 - 账号 / 权限系统（纯本机自用）
-- 附件存储与在线预览（面板不存素材文件本身）
+- 附件存储与**素材**在线预览（面板仍然不存素材文件本身；5.8 增补的只是**文档**——
+  而且是"引用路径 + 现读现渲染"，不是把文件搬进库里）
 - 多项目 / 多看板
 - 状态自定义（5 态固定，线性，不做成可配置的 stage_defs）
 - 富文本编辑器（`body` 用纯文本 + 换行）

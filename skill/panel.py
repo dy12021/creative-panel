@@ -33,13 +33,15 @@ LABEL = {"idea": "仅有创意", "clarifying": "正在明确", "clarified": "已
 # `edit` 能改哪些字段：就是 PATCH 的白名单（SPEC 5），不多不少。
 # 白名单外的字段服务端一律 422，所以这里重复校验没有意义；**顺序**要定死，
 # 用来念"改了哪几个字段"。这份表与 store.FIELDS 的一致性由测试上锁。
-EDIT_FIELDS = ("title", "body", "tags", "source", "blocked_note", "position")
+EDIT_FIELDS = ("title", "body", "tags", "source", "blocked_note", "position",
+               "project_dir", "agent_session")
 
 # 字段名的中文显示，**只用于显示**，跟 LABEL 是同一个理由：安装目录里没有
 # server/store.py 可 import，这份拷贝无法避免，靠 test_cli_edit_field_table_
 # matches_the_server 锁住漂移（标签被复用给另一个字段比缺个翻译更毒）。
 FIELD_LABEL = {"title": "标题", "body": "描述", "source": "来源",
-               "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置"}
+               "tags": "标签", "blocked_note": "阻塞备注", "position": "排序位置",
+               "project_dir": "项目主文件夹", "agent_session": "agent 对话名"}
 
 # events.kind 同样只用于显示。时间线是给 agent 读的一行人话，
 # "note / edited" 这种裸枚举混在里面等于让调用方再翻译一遍。
@@ -195,6 +197,10 @@ def build_parser():
     n.add_argument("--body", default="")
     n.add_argument("--tags", help="逗号分隔，首尾逗号服务端自己处理")
     n.add_argument("--source", default="")
+    n.add_argument("--project-dir", dest="project_dir",
+                   help="项目主文件夹（作品真正待着的工作目录）")
+    n.add_argument("--agent-session", dest="agent_session",
+                   help="这次 agent 对话的名字，面板会一直显示它")
 
     l = sub.add_parser("list", help="按状态/标签/关键词/阻塞筛选")
     l.add_argument("--status", help="中英文状态名都收")
@@ -211,6 +217,9 @@ def build_parser():
     e.add_argument("--blocked-note", dest="blocked_note",
                    help="改阻塞备注文字，不改卡住与否（那是 block/unblock 的活）")
     e.add_argument("--position", help="排到本列第几位，数字")
+    e.add_argument("--project-dir", dest="project_dir", help="项目主文件夹")
+    e.add_argument("--agent-session", dest="agent_session",
+                   help="把这次的 agent 对话名记到卡上（换话题了就再打一次）")
 
     s = sub.add_parser("show", help="看一张卡的详情与时间线")
     s.add_argument("id")
@@ -231,6 +240,26 @@ def build_parser():
     sub.add_parser("unblock", help="解除卡住").add_argument("id")
     sub.add_parser("stats", help="五列各几张")
     sub.add_parser("delete", help="删除一张卡").add_argument("id")
+
+    # 文档是"引用"不是"附件"：db 里只有路径，正文读的时候现读。所以 doc rm
+    # 删的是面板上的那条指针，磁盘上的文件一个字节都不会动——这一点印在帮助
+    # 里，免得有人以为它会删文件。
+    dc = sub.add_parser("doc", help="挂载/移除/查看这张卡引用的项目文档")
+    dsub = dc.add_subparsers(dest="doc_cmd", required=True)
+    dsub.add_parser("list", help="列出引用了哪些文档").add_argument("id")
+
+    da = dsub.add_parser("add", help="挂载一篇文档（.md/.markdown/.mdx/.txt）")
+    da.add_argument("id")
+    da.add_argument("path", help="相对路径按面板的启动目录解析，建议直接给绝对路径")
+    da.add_argument("--title", default="", help="留空就用文件名")
+
+    dr = dsub.add_parser("rm", help="移除引用，不动磁盘上的文件")
+    dr.add_argument("id")
+    dr.add_argument("doc_id")
+
+    ds = dsub.add_parser("show", help="把文档正文打到标准输出")
+    ds.add_argument("id")
+    ds.add_argument("doc_id")
     return p
 
 
@@ -335,6 +364,79 @@ def _timeline(events):
                                        msg))
 
 
+def _doc_ids_hint(idea_id):
+    """把"这张卡当前挂了哪些文档"拼成一句，附在报错后面。
+
+    idea_docs 的 id 是**全局**自增的，和卡片的 id 不是一套号（#7 的卡上可能挂
+    着 文档#5）。两者都印成 "#" 时，人和 agent 都会顺手把卡片的号填进 doc rm，
+    报一句"这张卡上没有 #7 这份文档"，然后卡在这猜下一个号。把候选直接报出来
+    比让人猜一轮便宜得多。
+    """
+    try:
+        items = _obj(call("GET", "/api/ideas/%s/docs" % idea_id),
+                     "文档清单", "docs", types={"docs": list})["docs"]
+    except Fail:
+        return ""
+    if not items:
+        return "  这张卡当前没有挂任何文档。"
+    return "  这张卡当前挂的：%s" % "、".join(
+        "文档#%s=%s" % (x.get("id"), x.get("title")) for x in items)
+
+
+def _no_such_doc(idea_id, doc_id):
+    return Fail("#%s 上没有 文档#%s\n%s" % (idea_id, doc_id, _doc_ids_hint(idea_id)))
+
+
+def _doc(a):
+    """文档是引用：db 里只有路径，正文要的时候现读。"""
+    k = a.doc_cmd
+    if k == "list":
+        items = _obj(call("GET", "/api/ideas/%s/docs" % a.id),
+                     "文档清单", "docs", types={"docs": list})["docs"]
+        if not items:
+            print("#%s 还没有挂项目文档" % a.id)
+            return
+        for raw in items:
+            d = _obj(raw, "文档清单里的一条",
+                     "id", "path", "title", "exists",
+                     types={"id": int, "path": str, "title": str, "exists": bool})
+            # 一律叫「文档#N」而不是「#N」：文档 id 是全局自增的，和卡片 id
+            # 不是一套号，写成同一个样子迟早有人把卡片的号填进来。
+            print("文档#%-3d %s%s" % (d["id"], d["title"],
+                                      "" if d["exists"] else "   ← 文件已不在原处"))
+            print("        %s" % d["path"])
+    elif k == "add":
+        d = _obj(call("POST", "/api/ideas/%s/docs" % a.id,
+                      json={"path": a.path, "title": a.title}),
+                 "挂载结果", "id", "path", "title",
+                 types={"id": int, "path": str, "title": str})
+        print("✔ #%s 已挂载文档：文档#%d %s" % (a.id, d["id"], d["title"]))
+        print("    %s" % d["path"])
+    elif k == "rm":
+        try:
+            call("DELETE", "/api/ideas/%s/docs/%s" % (a.id, a.doc_id))
+        except Fail as e:
+            if e.status == 404:
+                raise _no_such_doc(a.id, a.doc_id)
+            raise
+        print("✔ #%s 已移除 文档#%s 的引用（磁盘上的文件没动）" % (a.id, a.doc_id))
+    elif k == "show":
+        try:
+            d = _obj(call("GET", "/api/ideas/%s/docs/%s/content" % (a.id, a.doc_id)),
+                     "文档内容", "title", "path", "exists", "text",
+                     types={"title": str, "path": str, "exists": bool, "text": str})
+        except Fail as e:
+            if e.status == 404:
+                raise _no_such_doc(a.id, a.doc_id)
+            raise
+        if not d["exists"]:
+            raise Fail("#%s 引用的 文档#%s 已经不在原处：%s"
+                       % (a.id, a.doc_id, d["path"]))
+        sys.stdout.write(d["text"])
+        if d["text"] and not d["text"].endswith("\n"):
+            sys.stdout.write("\n")
+
+
 def _show(a):
     d = _obj(call("GET", "/api/ideas/%s" % a.id), "创意详情",
              "id", "title", "status", "blocked", "blocked_note",
@@ -350,6 +452,21 @@ def _show(a):
         print("  标签：%s" % "、".join(tags))
     if d["body"]:
         print("  描述：%s" % d["body"].replace("\n", "\n        "))
+    # project_dir / agent_session / docs 是 v2 才有的键，不进上面那串必填键：
+    # 老服务端返回的详情缺它们时，这里该安静地少显示两行，而不是报"格式不对"
+    # ——那是给人看的排障信息，不是版本检查。doc 子命令走自己的端点，版本对不
+    # 对会在那里以 detail 的形式报出来。
+    if d.get("project_dir"):
+        print("  项目主文件夹：%s" % d["project_dir"])
+    if d.get("agent_session"):
+        print("  agent 对话：%s" % d["agent_session"])
+    docs = d.get("docs") or []
+    if docs:
+        print("  ── 项目文档 ──")
+        for doc in docs:
+            flag = "" if doc.get("exists") else "   ← 文件已不在原处"
+            print("  文档#%s %s%s" % (doc["id"], doc["title"], flag))
+            print("      %s" % doc["path"])
     print("  ── 时间线 ──")
     _timeline(d["events"])
 
@@ -387,13 +504,24 @@ def _stats():
 def dispatch(a):
     c = a.cmd
     if c == "new":
-        d = _obj(call("POST", "/api/ideas",
-                      json={"title": a.title, "body": a.body,
-                            "tags": a.tags, "source": a.source}),
+        # 只把真给了的字段发出去，理由和 _edit_payload 完全一样：不带
+        # --project-dir 时 argparse 给的是 None，直接透传会让服务端 null
+        # 守卫拒掉整条请求（"项目主文件夹 不能为 null"），而这里本来只想
+        # 「没填」。缺席用 ""，null 交给 store 报——两者语义不同。
+        payload = {"title": a.title, "body": a.body, "tags": a.tags,
+                   "source": a.source}
+        for k in ("project_dir", "agent_session"):
+            v = getattr(a, k, None)
+            if v is not None:
+                payload[k] = v
+        d = _obj(call("POST", "/api/ideas", json=payload),
                  "新建结果", "id", "title", "status",
                  types={"id": int, "title": str, "status": str})
         print("✔ 已创建 #%d「%s」  状态=%s" % (d["id"], d["title"],
                                               label(d["status"])))
+        if payload.get("project_dir") or payload.get("agent_session"):
+            print("    项目主文件夹：%s" % payload.get("project_dir", ""))
+            print("    agent 对话：%s" % payload.get("agent_session", ""))
     elif c == "list":
         _list(a)
     elif c == "edit":
@@ -416,6 +544,8 @@ def dispatch(a):
     elif c == "delete":
         call("DELETE", "/api/ideas/%s" % a.id)
         print("✔ 已删除 #%s" % a.id)
+    elif c == "doc":
+        _doc(a)
     return 0
 
 

@@ -21,6 +21,18 @@ STATUS_INDEX = {k: i for i, k in enumerate(STATUS_KEYS)}
 
 ZERO_TAG = ","
 
+# ideas 表新增列 + idea_docs 表后的 schema 版本。用来判断存量库有没有迁移过。
+SCHEMA_VERSION = 2
+
+# v2 新增的两列。ALTER TABLE ADD COLUMN 只在列真的缺失时才跑——靠 PRAGMA
+# table_info 判存在性，而不是只看 user_version：中途存在过手工改过表的库，
+# user_version 对不上但列已经在了，只信版本号就会撞 duplicate column。
+# NOT NULL + 常量默认值是 SQLite 允许的，老行自动补空串。
+_V2_COLUMNS = (
+    ("project_dir", "TEXT NOT NULL DEFAULT ''"),
+    ("agent_session", "TEXT NOT NULL DEFAULT ''"),
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ideas (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,6 +43,8 @@ CREATE TABLE IF NOT EXISTS ideas (
   blocked_note TEXT NOT NULL DEFAULT '',
   tags         TEXT NOT NULL DEFAULT ',',
   source       TEXT NOT NULL DEFAULT '',
+  project_dir  TEXT NOT NULL DEFAULT '',
+  agent_session TEXT NOT NULL DEFAULT '',
   position     REAL NOT NULL DEFAULT 0,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
@@ -38,6 +52,18 @@ CREATE TABLE IF NOT EXISTS ideas (
   CHECK (status IN ('idea','clarifying','clarified','building','done'))
 );
 CREATE INDEX IF NOT EXISTS idx_ideas_status ON ideas(status);
+
+-- 卡片引用的项目文档：只存**路径**，不存内容。文档在外面改了，面板重新读就是
+-- 新的（SPEC 10.1）。position 是挂载次序，按登记先后递增。
+CREATE TABLE IF NOT EXISTS idea_docs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  idea_id    INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  path       TEXT NOT NULL,
+  title      TEXT NOT NULL DEFAULT '',
+  position   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_idea_docs_idea ON idea_docs(idea_id, position, id);
 
 CREATE TABLE IF NOT EXISTS events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +109,24 @@ def connect():
 
 
 def init_db():
-    connect().executescript(SCHEMA)
+    """建表 + 幂等迁移。
+
+    executescript 里的 CREATE TABLE IF NOT EXISTS 对**已存在的表**是彻底的空操作，
+    它不会把新列补进老表——所以新列一律靠下面的 ALTER。只查列是否存在，不查
+    user_version：存量库可能来自任何一次手工改动，只信版本号会在"版本号是 0
+    但列已经在了"的库上撞 duplicate column 而起不来。
+    """
+    c = connect()
+    try:
+        c.executescript(SCHEMA)
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(ideas)")}
+        for name, decl in _V2_COLUMNS:
+            if name not in cols:
+                c.execute("ALTER TABLE ideas ADD COLUMN %s %s" % (name, decl))
+        c.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+        c.commit()
+    finally:
+        c.close()
 
 
 def now_iso():
@@ -98,6 +141,18 @@ def now_iso():
             "SELECT strftime('%Y-%m-%dT%H:%M:%f','now','localtime')").fetchone()[0]
     finally:
         c.close()
+
+
+def iso_from_timestamp(ts: float) -> str:
+    """把 POSIX 时间戳转成与 now_iso 同一形态的字符串。
+
+    文件 mtime 要和 created_at / updated_at 在同一个时间轴上排序、给人看，
+    所以不能直接塞一个 Unix 秒数进去——形态不一致会让"这份文档什么时候改过"
+    在时间线上没法和卡片事件对照。
+    """
+    import datetime
+    dt = datetime.datetime.fromtimestamp(ts)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 def normalize_tags(raw: str) -> str:
