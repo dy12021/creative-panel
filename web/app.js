@@ -14,11 +14,16 @@ const STATUS_LABEL = {
 };
 
 const state = {
-  items: [],       // 当前筛选后的列表项（12 字段，不含 events）
+  items: [],       // 当前筛选后的列表项（12 字段，不含 events，含 docs_count）
   tags: new Set(), // 标签并集，只增不减，见 renderTagFilter
   filter: { q: "", tag: "", blocked: false },
   openId: null
 };
+
+/* 抽屉里「项目文档」区块的临时状态。
+ * 清单随抽屉重绘从 idea.docs 来（GET /api/ideas/{id} 一次就带 docs），
+ * 正文按需取：cache[docId] 存已读回来的 content，重绘时不必再打一次请求。 */
+const docsState = { ideaId: null, docs: [], open: null, cache: {} };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -205,6 +210,12 @@ function card(i) {
     c.classList.add("is-blocked");
     meta.append(el("span", "tag is-blocked-tag", "卡住"));
   }
+  // 项目文档角标：不点开抽屉也知道这张卡挂了文档（list 里只有 docs_count）
+  if (i.docs_count > 0) {
+    const badge = el("span", "tag is-doc-tag", "📄 " + i.docs_count);
+    badge.title = "挂着 " + i.docs_count + " 篇项目文档";
+    meta.append(badge);
+  }
   body.append(meta);
   c.append(body);
   c.addEventListener("click", () => {
@@ -315,11 +326,39 @@ function drawDrawer(id, idea) {
   if (idea.source) sub.append(el("span", "drawer-source", idea.source));
   body.append(sub);
 
-  // 完整描述（body 可能是多行，纯文本保留换行）
+  /* 描述：从只读 <div> 换成可编辑 <textarea>（最少 3 行、随内容增高）。
+   * 原来只能看不能改——描述是账本里最该随手补充的字段，却只能靠 CLI 写。
+   * 自动增高用 scrollHeight：先把 height 归 auto 才能量到真实内容高。 */
   body.append(el("h3", "sec-h", "描述"));
-  const bd = el("div", "drawer-body-text");
-  bd.textContent = idea.body || "（还没有描述）";
+  const bd = el("textarea", "drawer-body-edit");
+  bd.rows = 3;
+  bd.value = idea.body || "";
+  bd.placeholder = "为什么想做、给谁看、要什么效果";
+  const autoGrow = () => {
+    bd.style.height = "auto";
+    bd.style.height = bd.scrollHeight + "px";
+  };
+  bd.addEventListener("input", autoGrow);
+  autoGrow();                             // 打开时就按已有内容定高
   body.append(bd);
+  const bdSave = el("button", "secondary desc-save", "保存描述");
+  bdSave.onclick = () => saveField(id, "body", bd, "描述", bdSave);
+  body.append(bdSave);
+
+  /* 项目：主文件夹 + agent 对话名。两个都是 PATCH 的独立字段，各配一个保存按钮——
+   * 共用一个「保存项目」会让人不确定到底存了哪个。传空串即清空（传 null 是 422）。 */
+  body.append(el("h3", "sec-h", "项目"));
+  projectRow(body, id, "project_dir", idea.project_dir || "", "项目主文件夹", "D:\\coding\\我的作品");
+  projectRow(body, id, "agent_session", idea.agent_session || "", "agent 对话名", "与 agent 的对话名");
+
+  /* 项目文档：清单 + 按需预览 + 挂载/移除。清单直接用 idea.docs（详情里一次带全），
+   * 不为「打开抽屉」再打一次 /docs。 */
+  body.append(el("h3", "sec-h", "项目文档"));
+  syncDocs(id, idea.docs);
+  const docsHost = el("div", "docs-host");
+  docsHost.id = "docs-host";
+  body.append(docsHost);
+  drawDocs(docsHost, id);
 
   /* 标签编辑：整串编辑比逐个加删省事，也避免"最后剩一个标签时删不掉"这种
    * 半吊子交互。PATCH tags 传逗号串，服务端统一规范化（SPEC 4.2）。 */
@@ -446,6 +485,398 @@ function drawDrawer(id, idea) {
   });
   if (!(idea.events || []).length) tl.append(el("li", "tl-empty", "还没有记录"));
   body.append(tl);
+}
+
+/* ------------------------------------------------------------ 字段保存（描述/项目）
+ *
+ * 三个字段（body / project_dir / agent_session）都是 PATCH 的白名单字段，
+ * 语义一样，抽成一个函数。清空靠传空串：传 null 服务端会 422
+ * （「项目主文件夹 不能为 null，请传空串」），所以这里永远传字符串。
+ *
+ * **保存后不重绘抽屉**：重绘会把其它输入框里还没保存的字冲掉——用户先填好
+ * 主文件夹和对话名、再点第一个「保存」，第二个框里的字就没了。只回填自己那一个
+ * 输入框（服务端会规范化，比如去掉首尾空白），看板刷一次即可。
+ */
+async function saveField(id, key, input, label, btn) {
+  btn.disabled = true;
+  try {
+    const got = await api("PATCH", "/api/ideas/" + id, { [key]: input.value });
+    input.value = got[key] == null ? "" : got[key];
+    await load();                         // 看板跟着更新
+    drawerMsg(label + "已保存", "ok");
+  } catch (e) {
+    drawerMsg(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function projectRow(parent, id, key, value, label, placeholder) {
+  const row = el("label", "proj-row");
+  row.append(el("span", "proj-label", label));
+  const line = el("div", "proj-line");
+  const input = el("input", "proj-input");
+  input.type = "text";
+  input.placeholder = placeholder;
+  input.value = value;
+  input.autocomplete = "off";
+  const btn = el("button", "secondary", "保存");
+  btn.type = "button";
+  btn.onclick = () => saveField(id, key, input, label, btn);
+  line.append(input, btn);
+  row.append(line);
+  parent.append(row);
+}
+
+/* ------------------------------------------------------------ 项目文档（SPEC 10）
+ *
+ * 清单的增删只打 /api/ideas/{id}/docs（GET 回清单），不重 GET 整条卡片——
+ * 抽屉里别的地方不需要跟着变，整块重绘会把用户正在填的输入框清空。
+ */
+function syncDocs(ideaId, docs) {
+  if (docsState.ideaId !== ideaId) {
+    docsState.ideaId = ideaId;
+    docsState.open = null;
+    docsState.cache = {};
+  }
+  docsState.docs = docs || [];
+  // 预览开着的那条被移除了：收起，否则会渲染出一段没有归属的预览
+  if (docsState.open !== null && !docsState.docs.some(d => d.id === docsState.open)) {
+    docsState.open = null;
+  }
+}
+
+async function refreshDocs(ideaId, host) {
+  const r = await api("GET", "/api/ideas/" + ideaId + "/docs");
+  syncDocs(ideaId, r.docs);
+  await load();                           // 看板卡片的文档角标
+  if (state.openId === ideaId && host) drawDocs(host, ideaId);
+}
+
+/* 字节数 -> 人话。与 CLI 同一套口径（KB 保留一位、不到 1 KB 直接给字节）。 */
+function fmtSize(n) {
+  if (n == null) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+async function openDoc(ideaId, docId, host) {
+  if (docsState.open === docId) {         // 再点一次 = 收起
+    docsState.open = null;
+    drawDocs(host, ideaId);
+    return;
+  }
+  docsState.open = docId;
+  drawDocs(host, ideaId);                 // 先把「读取中…」画出来
+  let c = docsState.cache[docId];
+  if (!c) {
+    try {
+      c = await api("GET", "/api/ideas/" + ideaId + "/docs/" + docId + "/content");
+      // 文件不在原处的不缓存：人把文件放回去之后要能一刷新就读到
+      if (c.exists) docsState.cache[docId] = c;
+      else docsState.cache[docId] = null;
+    } catch (e) {
+      c = { error: e.message };
+      docsState.cache[docId] = c;
+    }
+  }
+  if (state.openId === ideaId && docsState.open === docId) drawDocs(host, ideaId);
+}
+
+function docPreview(doc) {
+  const box = el("div", "doc-preview");
+  const c = docsState.cache[doc.id];
+  if (!c) { box.append(el("p", "doc-note", "正在读取…")); return box; }
+  if (c.error) { box.append(el("p", "doc-note is-bad", c.error)); return box; }
+  if (!c.exists) {
+    // 200 + exists:false：文件被人在外面删了。引用留着（那是用户的账本），
+    // 但要说清现状，不能显示成一片空白让人以为接口坏了。
+    box.append(el("p", "doc-note is-warn",
+      "文件已不在原处。引用仍然留着，确认后可以点「移除」把它从卡片上摘掉。"));
+    return box;
+  }
+  if (c.truncated) box.append(el("p", "doc-note is-warn", "内容较长，只显示前 512 KB"));
+  const md = el("div", "md");
+  // 全站唯一一处 innerHTML。mdToHtml 先整体转义再格式化，用户文档里的
+  // 原始字符不可能原样进 DOM——这是硬要求，不是风格选择。
+  md.innerHTML = mdToHtml(c.text || "");
+  box.append(md);
+  return box;
+}
+
+function drawDocs(host, ideaId) {
+  host.textContent = "";
+  const docs = docsState.docs || [];
+
+  const list = el("div", "doc-list");
+  if (!docs.length) {
+    list.append(el("p", "doc-empty", "还没挂文档。把 SPEC 或 README 的路径挂上来，随时在这里看。"));
+  }
+  docs.forEach(d => {
+    const item = el("div", "doc-item" + (docsState.open === d.id ? " is-open" : ""));
+    const open = el("button", "doc-open");
+    open.type = "button";
+    open.append(el("span", "doc-title", d.title || "（无标题）"));
+    open.append(el("span", "doc-path", d.path));   // 路径给等宽字体，逐字对齐好核对
+    const bits = [];
+    if (!d.exists) bits.push("文件已不在原处");
+    else {
+      if (d.size != null) bits.push(fmtSize(d.size));
+      if (d.modified_at) bits.push("改于 " + fmtTime(d.modified_at));
+    }
+    open.append(el("span", "doc-meta", bits.join(" · ")));
+    open.onclick = () => openDoc(ideaId, d.id, host);
+    item.append(open);
+
+    const rm = el("button", "secondary doc-remove", "移除");
+    rm.type = "button";
+    rm.onclick = async () => {
+      rm.disabled = true;
+      try {
+        await api("DELETE", "/api/ideas/" + ideaId + "/docs/" + d.id);
+        delete docsState.cache[d.id];
+        if (docsState.open === d.id) docsState.open = null;
+        drawerMsg("");
+        await refreshDocs(ideaId, host);
+        drawerMsg("已移除「" + (d.title || d.path) + "」", "ok");
+      } catch (e) {
+        rm.disabled = false;
+        drawerMsg(e.message, "bad");
+      }
+    };
+    item.append(rm);
+    if (docsState.open === d.id) item.append(docPreview(d));
+    list.append(item);
+  });
+  host.append(list);
+
+  const form = el("div", "doc-add");
+  const pIn = el("input", "doc-add-path");
+  pIn.type = "text";
+  pIn.placeholder = "D:\\coding\\作品\\SPEC.md";
+  pIn.autocomplete = "off";
+  const tIn = el("input", "doc-add-title");
+  tIn.type = "text";
+  tIn.placeholder = "标题（可留空）";
+  tIn.autocomplete = "off";
+  const add = el("button", "secondary doc-add-btn", "挂载");
+  add.type = "button";
+  add.onclick = async () => {
+    const p = pIn.value.trim();
+    if (!p) { drawerMsg("文档路径不能为空", "warn"); return; }
+    const payload = { path: p };
+    const t = tIn.value.trim();
+    if (t) payload.title = t;            // 省略 title，服务端用文件名兜底
+    add.disabled = true;
+    try {
+      await api("POST", "/api/ideas/" + ideaId + "/docs", payload);
+      pIn.value = "";
+      tIn.value = "";
+      drawerMsg("");
+      await refreshDocs(ideaId, host);
+      drawerMsg("已挂载「" + (t || p) + "」", "ok");
+    } catch (e) {
+      drawerMsg(e.message, "bad");       // 例如「这份文档已经挂在这张卡上了」
+      add.disabled = false;
+    }
+  };
+  form.append(pIn, tIn, add);
+  host.append(form);
+}
+
+/* ------------------------------------------------------------ markdown 渲染器
+ *
+ * 自己写、零依赖（SPEC 12：不引任何 CDN 与库）。
+ *
+ * **安全顺序是硬要求：先把整段文本做 HTML 转义，再做格式化。**
+ * 反过来（先格式化再转义）会让用户文档里的原始字符有机会落进 innerHTML；
+ * 只有反过来才可能把标记当数据、把数据当标记，两者的信任边界正好相反。
+ * 转义之后 ``*``、``|``、``#`` 这些标记原样保留，格式化照常工作。
+ *
+ * 支持范围够用即可：ATX 标题、围栏代码块、行内代码、粗体、斜体、删除线、
+ * 有序/无序列表、引用、分隔线、表格。表格是刚需——项目的 SPEC 大量用表格。
+ * 链接只放行 http/https/mailto 与相对地址（挡 javascript: 伪协议）。
+ * 图片不渲染成 <img>：本地路径 + 无 CSP 白名单会变成一串坏图，降级成 alt 文字。
+ */
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// 只放行这三种带协议头的地址；其余（javascript: / data: / vbscript: …）降级成纯文本。
+const MD_OK_SCHEME = /^(?:https?:|mailto:)/i;
+
+function isSafeUrl(u) {
+  // 先去掉控制字符再判协议：浏览器解析 URL 时会吞掉 \t \n 这类字符，
+  // 「java\tscript:alert(1)」按明面看是没有协议头的。
+  const probe = String(u).replace(/[\u0000-\u0020\u007f-\u009f]/g, "");
+  if (/^[a-z][a-z0-9+.-]*:/i.test(probe)) return MD_OK_SCHEME.test(probe);
+  return true;                            // 相对地址：无协议头，落在 127.0.0.1 自己的域下
+}
+
+// 占位符用 U+0000 包裹下标：转义不会碰它，正则也不会误当成 markdown 标记。
+const TOK = "\u0000";
+
+function token(store, html) {
+  store.push(html);
+  return TOK + (store.length - 1) + TOK;
+}
+
+function inlineMd(src) {
+  const store = [];
+  let t = src;
+  // 行内代码先摘出来：代码里的 * _ # 不该被当成强调（顺序问题，先摘才不会挨刀）
+  t = t.replace(/`([^`\n]+)`/g, (m, c) => token(store, "<code>" + c + "</code>"));
+  // 图片降级成文字：alt + 一个标记，让人知道原来这里有张图
+  t = t.replace(/!\[([^\]]*)\]\([^)\s]*(?:\s+"[^"]*")?\)/g,
+    (m, alt) => token(store, '<span class="md-img">［图片］' + (alt || "") + "</span>"));
+  // 链接：协议白名单之外一律降级成「文字（地址）」，点不动也就没有伪协议可执行
+  t = t.replace(/\[([^\]]*)\]\(([^)\s]*(?:\s+"[^"]*")?)\)/g, (m, text, dest) => {
+    const url = dest.replace(/\s+"[^"]*"$/, "");
+    if (isSafeUrl(url)) {
+      return token(store, '<a href="' + url + '" target="_blank" rel="noopener noreferrer">'
+        + (text || url) + "</a>");
+    }
+    return text + "（" + url + "）";
+  });
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  t = t.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  t = t.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  // 下划线斜体只认成对的：文件名 a_b_c.html 不该被劈开
+  t = t.replace(/(^|[\s(（])_([^_]+)_(?=$|[\s).,，。!！?？:：;；])/g, "$1<em>$2</em>");
+  return t.replace(/\u0000(\d+)\u0000/g, (m, i) => store[+i]);
+}
+
+// 注意 RE_QUOTE 认的是 **&gt;** 而不是 >：本文件的顺序是「先整体转义、再解析块」，
+// 到这一步行首的 > 早就变成 &gt; 了。写成 > 会让引用块永远匹配不上（实测假阳性：
+// 单测第一版就是在这儿翻车的）。RE_ROW 用的 | 本来就不转义，所以不受影响。
+const RE_FENCE = /^\s*(`{3,}|~{3,})\s*(.*)$/;
+const RE_HEAD = /^(#{1,6})\s+(.*)$/;
+const RE_HR = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
+const RE_UL = /^\s*[-*+]\s+(.*)$/;
+const RE_OL = /^\s*\d+[.)]\s+(.*)$/;
+const RE_QUOTE = /^\s*&gt;\s?(.*)$/;
+const RE_ROW = /^\s*\|/;
+const RE_SEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
+
+function splitCells(row) {
+  let s = row.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map(c => c.trim());
+}
+
+// 相邻两行软换行怎么接：中文直接接上（不需要空格），英文补一个空格免得粘词。
+function joinSoft(a, b) {
+  if (!a || !b) return a + b;
+  const x = a[a.length - 1], y = b[0];
+  return /[0-9A-Za-z]/.test(x) && /[0-9A-Za-z]/.test(y) ? a + " " + b : a + b;
+}
+
+// 输入是**已转义**的行数组；块级解析与转义分开，是为了让引用块能递归复用。
+function renderMdBlocks(lines) {
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fence = RE_FENCE.exec(line);
+    if (fence) {
+      const marker = fence[1][0];
+      const body = [];
+      i++;
+      while (i < lines.length && !(RE_FENCE.test(lines[i]) && lines[i].trim()[0] === marker)) {
+        body.push(lines[i]);
+        i++;
+      }
+      i++;                                 // 吃掉收尾的 ```
+      out.push('<pre class="md-pre"><code>' + (body.join("\n") || " ") + "</code></pre>");
+      continue;
+    }
+
+    if (!line.trim()) { i++; continue; }
+
+    const h = RE_HEAD.exec(line);
+    if (h) {
+      const lv = h[1].length;
+      // 两个类都给：md-h 管通用排版，md-hN 管字号。别只给其中一个——
+      // style.css 里字号是按级别分的，少一个就全部退回默认大小。
+      out.push('<h' + lv + ' class="md-h md-h' + lv + '">' + inlineMd(h[2]) + "</h" + lv + ">");
+      i++;
+      continue;
+    }
+
+    if (RE_HR.test(line)) { out.push('<hr class="md-hr">'); i++; continue; }
+
+    // 表格：当前行像行、下一行像 |---| 分隔行，两条都成立才算表格
+    if (RE_ROW.test(line) && i + 1 < lines.length && RE_SEP.test(lines[i + 1])) {
+      const head = splitCells(line);
+      const align = splitCells(lines[i + 1]).map(c => {
+        const l = c.startsWith(":"), r = c.endsWith(":");
+        return l && r ? ' class="is-mid"' : l ? ' class="is-left"' : r ? ' class="is-right"' : "";
+      });
+      i += 2;
+      const rows = [];
+      while (i < lines.length && RE_ROW.test(lines[i])) { rows.push(splitCells(lines[i])); i++; }
+      const th = head.map((c, k) => "<th" + (align[k] || "") + ">" + inlineMd(c) + "</th>").join("");
+      const tb = rows.map(r => "<tr>" + head.map((_, k) =>
+        "<td" + (align[k] || "") + ">" + inlineMd(r[k] || "") + "</td>").join("") + "</tr>").join("");
+      out.push('<div class="md-tablewrap"><table class="md-table"><thead><tr>' + th
+        + "</tr></thead><tbody>" + tb + "</tbody></table></div>");
+      continue;
+    }
+
+    const q = RE_QUOTE.exec(line);
+    if (q) {
+      const body = [];
+      while (i < lines.length) {
+        const m = RE_QUOTE.exec(lines[i]);
+        if (!m) break;
+        body.push(m[1]);
+        i++;
+      }
+      out.push('<blockquote class="md-quote">' + renderMdBlocks(body) + "</blockquote>");
+      continue;
+    }
+
+    if (RE_UL.test(line) || RE_OL.test(line)) {
+      const ordered = RE_OL.test(line) && !RE_UL.test(line);
+      const items = [];
+      while (i < lines.length) {
+        const m = (ordered ? RE_OL : RE_UL).exec(lines[i]);
+        if (!m) break;
+        items.push("<li>" + inlineMd(m[1]) + "</li>");
+        i++;
+      }
+      out.push((ordered ? "<ol class=\"md-ol\">" : '<ul class="md-ul">') + items.join("") + "</" + (ordered ? "ol" : "ul") + ">");
+      continue;
+    }
+
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !RE_HEAD.test(lines[i])
+           && !RE_HR.test(lines[i]) && !RE_UL.test(lines[i]) && !RE_OL.test(lines[i])
+           && !RE_QUOTE.test(lines[i]) && !RE_FENCE.test(lines[i])
+           && !(RE_ROW.test(lines[i]) && i + 1 < lines.length && RE_SEP.test(lines[i + 1]))) {
+      para.push(inlineMd(lines[i].trim()));
+      i++;
+    }
+    if (para.length) out.push("<p>" + para.reduce(joinSoft) + "</p>");
+    else i++;                              // 理论上进不来，留着防死循环
+  }
+  return out.join("");
+}
+
+// 对外入口：先转义整段，再交给块级解析。
+function mdToHtml(src) {
+  if (src == null || src === "") return "";
+  return renderMdBlocks(escHtml(src).replace(/\r\n?/g, "\n").split("\n"));
 }
 
 function closeDrawer() {
@@ -643,7 +1074,10 @@ document.getElementById("composer-form").addEventListener("submit", async e => {
 Object.assign(window, {
   api, state, render, load, reload, el, card, STATUS_ORDER, STATUS_LABEL,
   buildRail, paintRail, slideRail, openDrawer, closeDrawer, moveCard,
-  positionFor, quickNew, fmtTime
+  positionFor, quickNew, fmtTime,
+  // 本任务新增：Playwright/控制台断言要能直接够到渲染器与文档区块
+  mdToHtml, escHtml, isSafeUrl, renderMdBlocks, fmtSize,
+  drawDocs, openDoc, refreshDocs, saveField, docsState
 });
 
 let qTimer = null;
