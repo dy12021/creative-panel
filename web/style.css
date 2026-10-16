@@ -370,6 +370,47 @@ button { cursor: pointer; }
 .secondary:hover { color: var(--fg); background: var(--panel); }
 .blocked-note { color: var(--fg-dim); font-size: .8rem; margin: .45rem 0 0; }
 
+/* ------------------------------------------------------------------ 危险区
+ *
+ * 删除按钮单独占一块、上面一条分隔线，和「推进」这类高频动作隔开。
+ * 它是小字链接而不是大红按钮：删除要不难找，但绝不能和推进长得像。
+ */
+.danger-zone {
+  margin-top: 2rem; padding-top: .9rem; border-top: 1px solid var(--line);
+}
+.danger-link {
+  background: transparent; border: 0; padding: .2rem 0; cursor: pointer;
+  color: var(--fg-dim); font-size: .78rem; text-decoration: underline;
+  text-underline-offset: 3px; text-decoration-color: color-mix(in srgb, var(--fg-dim) 45%, transparent);
+}
+.danger-link:hover { color: var(--blocked); text-decoration-color: var(--blocked); }
+.danger-link:focus-visible { outline: 2px solid var(--blocked); outline-offset: 2px; border-radius: 2px; }
+.danger-link:disabled { opacity: .45; cursor: default; text-decoration: none; }
+
+/* 删除确认表：和 composer 同一套弹窗语汇，只是窄一点、语气更硬 */
+.confirm {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0;
+  width: min(27rem, 92vw); background: var(--card); color: var(--fg);
+  box-shadow: 0 24px 64px rgba(21,32,51,.22);
+}
+.confirm::backdrop { background: rgba(23,32,45,.34); }
+.confirm-inner { padding: 1.1rem 1.2rem 1.2rem; }
+.confirm-title {
+  font-family: var(--display); font-size: 1rem; margin: 0 0 .6rem;
+  overflow-wrap: anywhere;
+}
+.confirm-lead { margin: 0 0 .35rem; font-size: .84rem; color: var(--fg); }
+.confirm-list { margin: 0 0 .7rem; padding-left: 1.15rem; font-size: .84rem; color: var(--fg); }
+.confirm-list li { margin: .12rem 0; }
+.confirm-note { margin: 0; font-size: .78rem; color: var(--fg-dim); }
+.confirm-actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+.confirm-actions .danger {
+  background: var(--blocked); color: #fff; border: 0;
+  border-radius: var(--r-sm); padding: .45rem 1rem; font-weight: 600;
+}
+.confirm-actions .danger:hover { background: color-mix(in srgb, var(--blocked) 88%, #000); }
+.confirm-actions .secondary { padding: .45rem .9rem; }
+
 /* --------------------------------------------- 描述（可编辑）/ 项目 / 项目文档 */
 
 .drawer-body-edit {

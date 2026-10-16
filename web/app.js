@@ -670,6 +670,80 @@ function drawDrawer(id, idea) {
   (idea.events || []).forEach(e => tl.append(eventLine(e)));
   if (!(idea.events || []).length) tl.append(el("li", "tl-empty", "还没有记录"));
   tlSlot.append(tl);
+
+  /* --- 危险区：删除 ----------------------------------------------------------
+   * 放在最后、单独用一条分隔线隔开。它是个小字链接而不是大红按钮：
+   * 删除要**不难找但不难误触**，和「推进」那种高频动作摆在一起会出事。
+   */
+  const danger = el("div", "danger-zone");
+  const delBtn = el("button", "danger-link", "删除这条创意");
+  delBtn.type = "button";
+  delBtn.onclick = async () => {
+    delBtn.disabled = true;
+    try {
+      if (!await confirmDelete(idea)) return;      // 取消：什么都不做
+      await api("DELETE", "/api/ideas/" + id);
+      closeDrawer();
+      await load();
+      // 抽屉已经关了，drawerMsg 会落到工具条下的横幅上（见该函数注释）
+      drawerMsg("已删除「" + idea.title + "」", "ok");
+    } catch (e) {
+      drawerMsg(e.message, "bad");
+    } finally {
+      delBtn.disabled = false;
+    }
+  };
+  danger.append(delBtn);
+  body.append(danger);
+}
+
+/* 删除确认，返回 Promise<boolean>。
+ *
+ * 把"会丢什么"逐条列出来，而不是只问一句"确定吗"：用户点确认前必须看清楚
+ * 标题对不对、知道时间线有多少条。不可撤销的操作不能只靠一个"确定吗"——
+ * 真删错了，账本就少了一段，而面板没有回收站可捞。
+ */
+function confirmDelete(idea) {
+  const dlg = document.getElementById("confirm");
+  document.getElementById("confirm-title").textContent = idea.title;
+
+  const list = document.getElementById("confirm-list");
+  list.textContent = "";
+  const evN = (idea.events || []).length;
+  const docN = (idea.docs || []).length;
+  const items = [];
+  if (evN) items.push(evN + " 条时间线记录");
+  if (docN) items.push(docN + " 篇项目文档的引用");
+  if (!items.length) items.push("（这条还没有历史记录，也没有挂文档）");
+  items.forEach(t => list.append(el("li", null, t)));
+
+  return new Promise(resolve => {
+    const ok = document.getElementById("confirm-ok");
+    const no = document.getElementById("confirm-cancel");
+    // 收尾统一走 finish，且**幂等**：<dialog> 的 close() 不清监听，而 #confirm
+    // 是复用节点，残留的监听会让第二次确认被第一次的闭包直接 resolve 掉——
+    // 那就是"删错了卡"，所以这个 guarded 收尾不能省。
+    let answered = false;
+    function finish(v) {
+      if (answered) return;
+      answered = true;
+      ok.removeEventListener("click", onOk);
+      no.removeEventListener("click", onNo);
+      dlg.removeEventListener("close", onClose);
+      if (dlg.open) dlg.close();
+      resolve(v);
+    }
+    function onOk() { finish(true); }
+    function onNo() { finish(false); }
+    // 监听 close 而不是 cancel：Esc、点「算了」、点确认都会走 close，
+    // 所以"没点确认就关掉了"一律判成取消，不会出现 Promise 悬着、
+    // 删除按钮永远卡在 disabled 的情况。
+    function onClose() { finish(false); }
+    ok.addEventListener("click", onOk);
+    no.addEventListener("click", onNo);
+    dlg.addEventListener("close", onClose);
+    dlg.showModal();
+  });
 }
 
 /* ------------------------------------------------------------ 项目文档（SPEC 10）
@@ -1263,11 +1337,13 @@ document.getElementById("drawer-close").onclick = () => closeDrawer();
 document.getElementById("drawer-full").onclick = () => setDrawerFull(!isDrawerFull());
 
 // Esc：全屏时先退出全屏，再按一次才关抽屉。直接一步关掉会让"我只是想看大图"
-// 变成丢上下文。记一个想法的 <dialog> 自己吃 Esc，别抢它的。
+// 变成丢上下文。
+//
+// **任何一个 <dialog> 开着时一律不插手**：模态 dialog 自己吃 Esc，关掉的是它。
+// 只避让 composer 是不够的——删除确认表也在这底下，一并交出去。
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
-  const dialog = document.getElementById("composer");
-  if (dialog && dialog.open) return;
+  if (document.querySelector("dialog[open]")) return;
   const d = document.getElementById("drawer");
   if (d.hidden) return;
   e.preventDefault();
