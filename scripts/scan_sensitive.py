@@ -87,6 +87,10 @@ def main():
                     if len([c for c in tok if c.isalpha()]) < 8 or \
                        len([c for c in tok if c.isdigit()]) < 6:
                         continue          # 真凭据得有足够多的字母+数字混排
+                # 本脚本自己的正则里必然写着要查的那些字面量，自指不算命中
+                if kind == "本机路径" and rel.replace("\\", "/").endswith(
+                        "scripts/scan_sensitive.py"):
+                    continue
                 hits.append((rel, i, name, kind, line.strip()[:150]))
 
     if not hits:
