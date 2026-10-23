@@ -58,13 +58,13 @@ description: >
 
 ```
 解释器: C:\ProgramData\anaconda3\python.exe
-CLI:    C:\Users\dy120\.minimax\skills\creative-panel\panel.py
+CLI:    %USERPROFILE%\.minimax\skills\creative-panel\panel.py
 ```
 
 下面的示例统一写成 `panel.py`，实际调用时把上面那两条填进去：
 
 ```bat
-"C:\ProgramData\anaconda3\python.exe" "C:\Users\dy120\.minimax\skills\creative-panel\panel.py" stats
+"C:\ProgramData\anaconda3\python.exe" "%USERPROFILE%\.minimax\skills\creative-panel\panel.py" stats
 ```
 
 输出是**给人看的中文**，不是 JSON。成功退出码 0，失败退出码 1 且只打一句人话，
@@ -163,7 +163,9 @@ panel.py doc show <id> <文档号>                                             R
    只能在建卡那一刻带 `--body`，所以不 `edit` 就没地方落笔，agent 只能请用户
    去网页抽屉里改。结论比 `--note` 更该进 body：body 是卡片一直带着的正文，
    note 只是时间线上的一行流水。
-4. **方案定了** → `advance <id> clarified --note "定了 6 段 H3，每段 90 秒"`。
+4. **方案定了、而且用户批准了这份文稿** → `advance <id> clarified --note "定了 6 段 H3，每段 90 秒"`。
+   批准之前停在 `clarifying`：文稿是 agent 自己写的，`clarified` 记的是「用户认可了」，
+   不是「agent 写完了」。写完就推进，等于替用户做了决定。
 5. **开始做** → 调对应的 skill 去做东西，做之前
    `advance <id> building --note "开始生成第 1-2 段"`。
 6. **交付完** → `advance <id> done --note "6 段全部交付，文件在 ..."`。
@@ -186,6 +188,10 @@ panel.py doc show <id> <文档号>                                             R
   一串空的推进记录等于没记。
 - **不许在没经用户确认的情况下直接跳到「完成成品」。** `done` 意味着有成品交付了，
   不是「差不多了」。
+- **不许在用户没批准文稿的情况下把卡片推到「已经明确」。** `clarified` 说的是
+  「用户认可了这份方案」，不是「agent 把方案写完了」。文稿是 agent 写的，
+  推进也得等用户点头——先把文稿摆给用户看，停在「正在明确」等回复。
+  （2026-10-20 用户定的规矩：没批准文稿不许调成「已经明确」。）
 - **做不下去就 `block` 写清原因**，不要硬撑，也不要悄悄跳过——卡在面板上比消失在
   对话里有用。
 - **不要替用户做决定。** 面板记的是用户的创意和用户的进度，不是 agent 的待办清单。
